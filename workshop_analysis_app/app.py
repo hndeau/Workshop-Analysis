@@ -1,9 +1,13 @@
 """Application workflows and command interpreter for WorkshopAnalysis."""
 
+import os
+import platform
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -29,9 +33,46 @@ from .tooling import (
 
 
 class WorkshopAnalysis:
-    def __init__(self, state_root, no_tool_bootstrap=False):
+    ANSI_COLORS = {
+        "reset": "\033[0m",
+        "bold": "\033[1m",
+        "muted": "\033[2m",
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "magenta": "\033[35m",
+        "cyan": "\033[36m",
+        "white": "\033[37m",
+    }
+    ARCHIVE_EXTENSIONS = {".pak", ".ucas", ".utoc", ".vpk"}
+    INTERESTING_METADATA_NAMES = {
+        "addoninfo.txt",
+        "appmanifest.acf",
+        "assetregistry.bin",
+        "manifest.vdf",
+        "metadata.json",
+        "publish_data.txt",
+    }
+    SUSPICIOUS_EXTENSIONS = {
+        ".bat",
+        ".cmd",
+        ".com",
+        ".dll",
+        ".exe",
+        ".jar",
+        ".js",
+        ".lnk",
+        ".msi",
+        ".ps1",
+        ".scr",
+        ".vbs",
+    }
+
+    def __init__(self, state_root, no_tool_bootstrap=False, debug=False):
         self.state_root = Path(state_root)
         self.no_tool_bootstrap = no_tool_bootstrap
+        self.debug = debug
 
     def new_default_config(self):
         tool_root = self.state_root / "tools"
@@ -111,6 +152,110 @@ class WorkshopAnalysis:
         return "{0} / {1}".format(
             game.get("Title"),
             WorkshopAnalysis.describe_workshop_content(item),
+        )
+
+    def describe_game_with_content_status(self, config, game, item):
+        return "{0} / {1}".format(
+            game.get("Title"),
+            self.describe_workshop_content_status(config, game, item),
+        )
+
+    @staticmethod
+    def format_bytes(size):
+        size = int(size or 0)
+        units = ("B", "KB", "MB", "GB", "TB")
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return "{0} {1}".format(int(value), unit)
+                return "{0:.1f} {1}".format(value, unit)
+            value /= 1024
+
+    @staticmethod
+    def detect_cpu_architecture():
+        raw_values = [
+            os.environ.get("PROCESSOR_ARCHITEW6432"),
+            os.environ.get("PROCESSOR_ARCHITECTURE"),
+            platform.machine(),
+        ]
+        raw = " ".join(value for value in raw_values if value).lower()
+        if "arm64" in raw or "aarch64" in raw:
+            return "arm64"
+        if "amd64" in raw or "x86_64" in raw or "x64" in raw:
+            return "x64"
+        if "x86" in raw or "i386" in raw or "i686" in raw:
+            return "x86"
+        return "x64"
+
+    @staticmethod
+    def source2_asset_regex_for_arch(architecture):
+        if architecture == "arm64":
+            return r"(^|[-_])cli-windows-arm64\.zip$|win(dows)?[-_].*arm64.*\.zip$"
+        if architecture == "x86":
+            return r"(^|[-_])cli-windows-x86\.zip$|win(dows)?[-_].*x86.*\.zip$"
+        return r"(^|[-_])cli-windows-x64\.zip$|win(dows)?[-_].*x64.*\.zip$"
+
+    @staticmethod
+    def tool_ready_for_game_type(config, game_type_id):
+        if game_type_id == "source2":
+            cli_path = as_path(config.get("Tools", {}).get("Source2", {}).get("CliPath"))
+            return bool(cli_path and cli_path.exists())
+        if game_type_id == "unreal5":
+            unreal5 = config.get("Tools", {}).get("Unreal5", {})
+            for key in ("RetocPath", "FModelPath", "UnrealPakPath"):
+                tool_path = as_path(unreal5.get(key))
+                if tool_path and tool_path.exists():
+                    return True
+        return False
+
+    @staticmethod
+    def analysis_complete_for_path(content_path):
+        content_path = Path(content_path)
+        markers = (
+            content_path / ".workshop_analysis" / "analysis_complete",
+            content_path / ".workshop_analysis" / "analysis_complete.json",
+            content_path / "analysis_complete.json",
+        )
+        return any(marker.exists() for marker in markers)
+
+    def content_has_archive_files(self, content_path, max_files=2000):
+        scanned = 0
+        try:
+            for path in Path(content_path).rglob("*"):
+                if path.is_file():
+                    scanned += 1
+                    if path.suffix.lower() in self.ARCHIVE_EXTENSIONS:
+                        return True
+                    if scanned >= max_files:
+                        return False
+        except OSError:
+            return False
+        return False
+
+    def describe_workshop_content_status(self, config, game, item):
+        badges = []
+        download_path = as_path(item.get("LastDownloadPath"))
+        downloaded = bool(download_path and download_path.exists())
+        badges.append("downloaded" if downloaded else "not downloaded")
+
+        if self.tool_ready_for_game_type(config, game.get("GameTypeId")):
+            badges.append("tool ready")
+
+        if downloaded and self.content_has_archive_files(download_path):
+            badges.append("needs extraction")
+
+        if downloaded and self.analysis_complete_for_path(download_path):
+            badges.append("analysis complete")
+
+        last_updated = item.get("LastDownloadUtc")
+        if last_updated:
+            badges.append("last updated {0}".format(last_updated.replace("T", " ")[:16]))
+
+        return "{0} ({1}) [{2}]".format(
+            item.get("Title"),
+            item.get("ContentId"),
+            "] [".join(badges),
         )
 
     @staticmethod
@@ -248,9 +393,13 @@ class WorkshopAnalysis:
             "Source 2 Viewer install directory", source2.get("InstallDir")
         )
         try:
+            architecture = self.detect_cpu_architecture()
+            asset_regex = self.source2_asset_regex_for_arch(architecture)
+            print("Detected CPU architecture: {0}".format(architecture))
+            print("Installing Source 2 Viewer CLI asset for {0}.".format(architecture))
             cli_path = install_zip_tool_from_github(
                 "ValveResourceFormat/ValveResourceFormat",
-                r"win.*(x64|64).*\.zip$|Source2Viewer.*Windows.*\.zip$|S2V.*Windows.*\.zip$",
+                asset_regex,
                 install_dir,
                 "Source2Viewer-CLI.exe",
             )
@@ -453,11 +602,30 @@ class WorkshopAnalysis:
         print("Removed game and {0} workshop item database entry/entries.".format(len(items)))
         return True
 
-    def add_workshop_content(self, database, game):
+    def add_workshop_content(self, paths, config, database, game):
         write_section("Add workshop content")
         content_id, title = self.prompt_workshop_content_fields()
         item = database.create_workshop_content(game["Id"], title, content_id)
         print("Added workshop content: {0}".format(self.describe_workshop_content(item)))
+        if prompt_yes_no("Download/install this workshop content now?", False):
+            game, item, download_path = self.download_and_record_workshop_content(
+                paths,
+                config,
+                database,
+                game,
+                item,
+            )
+            self.invoke_analysis_todo(
+                config,
+                game["GameTypeId"],
+                game,
+                item,
+                download_path,
+            )
+            self.print_file_inventory(download_path)
+            self.offer_analysis_actions(config, game, item, download_path)
+            print()
+            print("Done.")
         return item
 
     def prompt_workshop_content_fields(self):
@@ -510,7 +678,7 @@ class WorkshopAnalysis:
                 return
 
             write_section("Manage workshop content")
-            print(self.describe_workshop_content(item))
+            print(self.describe_workshop_content_status(config, game, item))
             print("[E] Edit workshop content")
             print("[R] Remove workshop content")
             print("[B] Back")
@@ -527,7 +695,7 @@ class WorkshopAnalysis:
                 continue
             print("WARNING: Invalid selection.")
 
-    def manage_game(self, config, database, game):
+    def manage_game(self, paths, config, database, game):
         while True:
             game = database.get_game(game["Id"])
             if not game:
@@ -541,7 +709,12 @@ class WorkshopAnalysis:
                 print()
                 print("Workshop content:")
                 for index, item in enumerate(items, start=1):
-                    print("[{0}] {1}".format(index, self.describe_workshop_content(item)))
+                    print(
+                        "[{0}] {1}".format(
+                            index,
+                            self.describe_workshop_content_status(config, game, item),
+                        )
+                    )
             else:
                 print()
                 print("No workshop content is associated with this game.")
@@ -556,7 +729,7 @@ class WorkshopAnalysis:
             if answer in ("b", "back", "q", "quit"):
                 return
             if answer in ("a", "add", "n", "new"):
-                self.add_workshop_content(database, game)
+                self.add_workshop_content(paths, config, database, game)
                 continue
             if answer in ("e", "edit"):
                 game = self.edit_game(config, database, game)
@@ -575,7 +748,8 @@ class WorkshopAnalysis:
                 continue
             print("WARNING: Invalid selection.")
 
-    def manage_catalog(self, config, database):
+    def manage_catalog(self, config, database, paths=None):
+        paths = paths or self.state_paths()
         while True:
             games = database.list_games()
             write_section("Game catalog")
@@ -601,7 +775,7 @@ class WorkshopAnalysis:
             except ValueError:
                 index = 0
             if 1 <= index <= len(games):
-                self.manage_game(config, database, games[index - 1])
+                self.manage_game(paths, config, database, games[index - 1])
                 continue
             print("WARNING: Invalid selection.")
 
@@ -617,6 +791,10 @@ class WorkshopAnalysis:
 
         while True:
             answer = input("Select a game or N: ").strip()
+            if not answer and not games:
+                answer = "n"
+            elif not answer and len(games) == 1:
+                answer = "1"
             if answer.lower() in ("n", "new"):
                 app_id, title = self.prompt_game_fields()
                 game_type = prompt_choice(
@@ -655,6 +833,8 @@ class WorkshopAnalysis:
 
         while True:
             answer = input("Select a game: ").strip().lower()
+            if not answer and len(games) == 1:
+                return games[0]
             if answer in ("b", "back", "q", "quit"):
                 return None
 
@@ -666,17 +846,26 @@ class WorkshopAnalysis:
                 return games[index - 1]
             print("WARNING: Invalid selection.")
 
-    def select_or_create_workshop_content(self, database, game):
+    def select_or_create_workshop_content(self, config, database, game):
         write_section("Workshop content for {0}".format(game.get("Title")))
         items = database.list_workshop_content(game["Id"])
 
         if items:
             for index, item in enumerate(items, start=1):
-                print("[{0}] {1} ({2})".format(index, item.get("Title"), item.get("ContentId")))
+                print(
+                    "[{0}] {1}".format(
+                        index,
+                        self.describe_workshop_content_status(config, game, item),
+                    )
+                )
         print("[N] New workshop content entry")
 
         while True:
             answer = input("Select workshop content or N: ").strip()
+            if not answer and not items:
+                answer = "n"
+            elif not answer and len(items) == 1:
+                return items[0]
             if answer.lower() in ("n", "new"):
                 content_id, title = self.prompt_workshop_content_fields()
                 return database.create_workshop_content(game["Id"], title, content_id)
@@ -738,16 +927,10 @@ class WorkshopAnalysis:
 
         command = [str(steamcmd_path)] + steamcmd_args
         if use_anonymous:
-            result = subprocess.run(
+            result = self.run_steamcmd_with_status(
                 command,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                "Downloading workshop content with SteamCMD",
             )
-            self.print_steamcmd_output(getattr(result, "stdout", ""))
         else:
             result = subprocess.run(command, check=False)
 
@@ -783,7 +966,7 @@ class WorkshopAnalysis:
                 "'{0}' or '{1}'.".format(primary_path, alternate_path)
             )
 
-        if result.returncode != 0:
+        if result.returncode != 0 and result.returncode != 7:
             print(
                 "WARNING: SteamCMD exited with code {0}, but downloaded content was found. Continuing.".format(
                     result.returncode
@@ -792,8 +975,70 @@ class WorkshopAnalysis:
 
         return download_path
 
+    def run_steamcmd_with_status(self, command, label):
+        output_options = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+
+        if self.debug:
+            print("{0}...".format(label))
+            result = subprocess.run(command, check=False, **output_options)
+            self.print_steamcmd_output(getattr(result, "stdout", ""), raw=True)
+            return result
+
+        if not sys.stdout.isatty():
+            print("{0}...".format(label))
+            result = subprocess.run(command, check=False, **output_options)
+            print("SteamCMD completed.")
+            return result
+
+        result_holder = {}
+        error_holder = {}
+
+        def worker():
+            try:
+                result_holder["result"] = subprocess.run(command, check=False, **output_options)
+            except Exception as exc:
+                error_holder["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        frames = "|/-\\"
+        index = 0
+        while thread.is_alive():
+            frame = frames[index % len(frames)]
+            print(
+                "\r{0} {1}".format(self.color_text(frame, "cyan"), label),
+                end="",
+                flush=True,
+            )
+            index += 1
+            time.sleep(0.12)
+
+        thread.join()
+        print("\r{0}\r".format(" " * (len(label) + 4)), end="", flush=True)
+
+        if error_holder:
+            raise error_holder["error"]
+
+        result = result_holder["result"]
+        if result.returncode == 0 or result.returncode == 7:
+            print("{0} {1}".format(self.color_text("OK", "green"), "SteamCMD download finished."))
+        else:
+            print(
+                "{0} SteamCMD finished with exit code {1}.".format(
+                    self.color_text("WARNING", "yellow"),
+                    result.returncode,
+                )
+            )
+        return result
+
     @staticmethod
-    def print_steamcmd_output(output):
+    def print_steamcmd_output(output, raw=False):
         if not output:
             return
 
@@ -805,9 +1050,216 @@ class WorkshopAnalysis:
             "CWorkThreadPool::~CWorkThreadPool: work processing queue not empty",
         )
         for line in output.splitlines():
-            if any(fragment in line for fragment in ignored_fragments):
+            if not raw and any(fragment in line for fragment in ignored_fragments):
                 continue
             print(line)
+
+    @staticmethod
+    def relative_path_label(base_path, file_path):
+        try:
+            return str(Path(file_path).relative_to(Path(base_path)))
+        except ValueError:
+            return str(file_path)
+
+    def build_file_inventory(self, content_path):
+        content_path = Path(content_path)
+        inventory = {
+            "Path": content_path,
+            "FileCount": 0,
+            "TotalSizeBytes": 0,
+            "Extensions": {},
+            "ArchiveFiles": [],
+            "InterestingMetadata": [],
+            "SuspiciousFiles": [],
+        }
+
+        if not content_path.exists():
+            return inventory
+
+        for path in content_path.rglob("*"):
+            if not path.is_file():
+                continue
+
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+
+            suffix = path.suffix.lower() or "<none>"
+            name = path.name.lower()
+            label = self.relative_path_label(content_path, path)
+
+            inventory["FileCount"] += 1
+            inventory["TotalSizeBytes"] += size
+            inventory["Extensions"][suffix] = inventory["Extensions"].get(suffix, 0) + 1
+
+            if suffix in self.ARCHIVE_EXTENSIONS:
+                inventory["ArchiveFiles"].append(label)
+            if name in self.INTERESTING_METADATA_NAMES:
+                inventory["InterestingMetadata"].append(label)
+            if suffix in self.SUSPICIOUS_EXTENSIONS:
+                inventory["SuspiciousFiles"].append(label)
+
+        return inventory
+
+    @staticmethod
+    def print_limited_list(title, values, limit=8):
+        if not values:
+            return
+        print("{0}:".format(title))
+        for value in values[:limit]:
+            print("  - {0}".format(value))
+        remaining = len(values) - limit
+        if remaining > 0:
+            print("  ... {0} more".format(remaining))
+
+    def print_file_inventory(self, content_path):
+        inventory = self.build_file_inventory(content_path)
+        write_section("Downloaded file inventory")
+        print("Path: {0}".format(inventory["Path"]))
+        print("Files: {0}".format(inventory["FileCount"]))
+        print("Total size: {0}".format(self.format_bytes(inventory["TotalSizeBytes"])))
+
+        extensions = sorted(
+            inventory["Extensions"].items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if extensions:
+            extension_text = ", ".join(
+                "{0}={1}".format(extension, count)
+                for extension, count in extensions[:12]
+            )
+            remaining = len(extensions) - 12
+            if remaining > 0:
+                extension_text = "{0}, ... {1} more".format(extension_text, remaining)
+            print("Extensions: {0}".format(extension_text))
+        else:
+            print("Extensions: none")
+
+        archive_counts = {}
+        for file_name in inventory["ArchiveFiles"]:
+            suffix = Path(file_name).suffix.lower()
+            archive_counts[suffix] = archive_counts.get(suffix, 0) + 1
+        if archive_counts:
+            detected = ", ".join(
+                "{0}={1}".format(extension, archive_counts[extension])
+                for extension in sorted(archive_counts)
+            )
+            print("Detected package files: {0}".format(detected))
+        else:
+            print("Detected package files: none")
+
+        self.print_limited_list("Interesting metadata", inventory["InterestingMetadata"])
+        self.print_limited_list("Suspicious executable/script-like files", inventory["SuspiciousFiles"])
+        return inventory
+
+    def print_content_listing(self, content_path, limit=80):
+        write_section("Downloaded content listing")
+        content_path = Path(content_path)
+        if not content_path.exists():
+            print("Content path does not exist: {0}".format(content_path))
+            return
+
+        listed = 0
+        for path in sorted(content_path.rglob("*")):
+            if not path.is_file():
+                continue
+            print(self.relative_path_label(content_path, path))
+            listed += 1
+            if listed >= limit:
+                break
+        if listed == 0:
+            print("No files found.")
+        elif listed >= limit:
+            print("... listing limited to {0} files".format(limit))
+
+    def run_content_scan(self, content_path):
+        inventory = self.build_file_inventory(content_path)
+        write_section("Content scan")
+        if inventory["SuspiciousFiles"]:
+            self.print_limited_list(
+                "Suspicious executable/script-like files",
+                inventory["SuspiciousFiles"],
+                limit=20,
+            )
+        else:
+            print("No executable/script-like files were detected by extension.")
+
+        if inventory["InterestingMetadata"]:
+            self.print_limited_list("Interesting metadata", inventory["InterestingMetadata"], limit=20)
+        else:
+            print("No known metadata files were detected.")
+
+        if inventory["ArchiveFiles"]:
+            self.print_limited_list("Package files", inventory["ArchiveFiles"], limit=20)
+        else:
+            print("No VPK/pak/utoc/ucas package files were detected.")
+
+    def run_extract_action(self, config, game, content_path):
+        write_section("Extract")
+        game_type_id = game.get("GameTypeId")
+        if game_type_id == "source2":
+            print("Source 2 package extraction should use Source2Viewer-CLI.")
+            print("Configured CLI: {0}".format(config["Tools"]["Source2"].get("CliPath") or "not configured"))
+        elif game_type_id == "unreal5":
+            unreal5 = config["Tools"]["Unreal5"]
+            print("UE5 package extraction should use retoc, FModel, or UnrealPak.")
+            print("retoc: {0}".format(unreal5.get("RetocPath") or "not configured"))
+            print("FModel: {0}".format(unreal5.get("FModelPath") or "not configured"))
+            print("UnrealPak: {0}".format(unreal5.get("UnrealPakPath") or "not configured"))
+        else:
+            print("No extraction action is available for game type '{0}'.".format(game_type_id))
+        print("Content path: {0}".format(content_path))
+
+    def run_decompile_action(self, config, game, workshop_item, content_path):
+        self.invoke_analysis_todo(
+            config,
+            game.get("GameTypeId"),
+            game,
+            workshop_item,
+            content_path,
+        )
+
+    @staticmethod
+    def open_folder(content_path):
+        content_path = Path(content_path)
+        if not content_path.exists():
+            print("Content path does not exist: {0}".format(content_path))
+            return
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", str(content_path)])
+            return
+        print("Open this folder manually: {0}".format(content_path))
+
+    def offer_analysis_actions(self, config, game, workshop_item, content_path):
+        while True:
+            write_section("Analysis actions")
+            self.print_menu_item("E", "Extract", "show extraction tooling for this game type", "green")
+            self.print_menu_item("L", "List", "print downloaded files", "cyan")
+            self.print_menu_item("D", "Decompile/convert", "show conversion/decompile workflow", "magenta")
+            self.print_menu_item("R", "Scan", "flag scripts, executables, packages, and metadata", "yellow")
+            self.print_menu_item("O", "Open folder", "open downloaded content in Explorer", "blue")
+            self.print_menu_item("B", "Back", "return to the previous menu", "white")
+
+            answer = input("Select an action [B]: ").strip().lower()
+            if answer in ("", "b", "back", "q", "quit"):
+                return
+            if answer in ("e", "extract"):
+                self.run_extract_action(config, game, content_path)
+                continue
+            if answer in ("l", "list"):
+                self.print_content_listing(content_path)
+                continue
+            if answer in ("d", "decompile", "convert"):
+                self.run_decompile_action(config, game, workshop_item, content_path)
+                continue
+            if answer in ("r", "scan"):
+                self.run_content_scan(content_path)
+                continue
+            if answer in ("o", "open"):
+                self.open_folder(content_path)
+                continue
+            print("WARNING: Invalid selection.")
 
     @staticmethod
     def invoke_analysis_todo(config, game_type_id, game, workshop_item, content_path):
@@ -841,11 +1293,22 @@ class WorkshopAnalysis:
         database.migrate_legacy_json(paths["LegacyJsonDbPath"])
         return paths, has_config, config, database
 
-    def download_and_record_workshop_content(self, paths, config, database, game, workshop_item):
-        game = self.prompt_game_type_for_game(config, database, game)
+    def download_and_record_workshop_content(
+        self,
+        paths,
+        config,
+        database,
+        game,
+        workshop_item,
+        prompt_for_game_type=True,
+        ensure_tools=True,
+    ):
+        if prompt_for_game_type:
+            game = self.prompt_game_type_for_game(config, database, game)
         game_type_id = game["GameTypeId"]
         config["Defaults"]["GameTypeId"] = game_type_id
-        self.ensure_tools_for_game_type(config, game_type_id)
+        if ensure_tools:
+            self.ensure_tools_for_game_type(config, game_type_id)
 
         download_path = self.invoke_workshop_download(config, game, workshop_item)
         downloaded_at = utc_now_iso()
@@ -857,6 +1320,179 @@ class WorkshopAnalysis:
         save_json_file(paths["ConfigPath"], config)
         return game, workshop_item, download_path
 
+    @staticmethod
+    def find_game_by_app_id(database, app_id):
+        for game in database.list_games():
+            if str(game.get("AppId")) == str(app_id):
+                return game
+        return None
+
+    @staticmethod
+    def find_workshop_item_by_content_id(database, game_id, content_id):
+        for item in database.list_workshop_content(game_id):
+            if str(item.get("ContentId")) == str(content_id):
+                return item
+        return None
+
+    def parse_one_shot_download_args(self, args):
+        options = {
+            "anonymous": None,
+            "ensure_tools": False,
+            "game_title": None,
+            "game_type_id": None,
+            "workshop_title": None,
+        }
+        positionals = []
+        index = 0
+        while index < len(args):
+            token = args[index]
+            if token in ("--anonymous",):
+                options["anonymous"] = True
+            elif token in ("--no-anonymous",):
+                options["anonymous"] = False
+            elif token in ("--with-tools", "--tool-bootstrap"):
+                options["ensure_tools"] = True
+            elif token in ("--no-tool-bootstrap",):
+                options["ensure_tools"] = False
+            elif token in ("--type", "-t"):
+                index += 1
+                if index >= len(args):
+                    raise ValueError("--type requires a value.")
+                options["game_type_id"] = args[index].strip().lower()
+            elif token.startswith("--type="):
+                options["game_type_id"] = token.split("=", 1)[1].strip().lower()
+            elif token in ("--game-title",):
+                index += 1
+                if index >= len(args):
+                    raise ValueError("--game-title requires a value.")
+                options["game_title"] = args[index].strip()
+            elif token.startswith("--game-title="):
+                options["game_title"] = token.split("=", 1)[1].strip()
+            elif token in ("--title", "--workshop-title"):
+                index += 1
+                if index >= len(args):
+                    raise ValueError("{0} requires a value.".format(token))
+                options["workshop_title"] = args[index].strip()
+            elif token.startswith("--title="):
+                options["workshop_title"] = token.split("=", 1)[1].strip()
+            elif token.startswith("--workshop-title="):
+                options["workshop_title"] = token.split("=", 1)[1].strip()
+            elif token.startswith("-"):
+                raise ValueError("Unknown download option: {0}".format(token))
+            else:
+                positionals.append(token)
+            index += 1
+
+        if len(positionals) != 2:
+            raise ValueError(
+                "Usage: download <AppID> <WorkshopContentID> "
+                "[--type source2|unreal5] [--anonymous]"
+            )
+
+        game_type_id = options["game_type_id"]
+        if game_type_id and game_type_id not in self.supported_game_type_ids():
+            raise ValueError(
+                "Unsupported game type '{0}'. Use one of: {1}.".format(
+                    game_type_id,
+                    ", ".join(sorted(self.supported_game_type_ids())),
+                )
+            )
+
+        options["app_id"] = positionals[0]
+        options["content_id"] = positionals[1]
+        return options
+
+    @staticmethod
+    def resolve_game_title(app_id, fallback=None):
+        if fallback:
+            return fallback
+        try:
+            resolved = get_steam_app_title(app_id)
+        except Exception as exc:
+            print("WARNING: Could not resolve game title from Steam: {0}".format(exc))
+            resolved = None
+        return resolved or "Steam App {0}".format(app_id)
+
+    @staticmethod
+    def resolve_workshop_title(content_id, fallback=None):
+        if fallback:
+            return fallback
+        try:
+            resolved = get_steam_workshop_item_title(content_id)
+        except Exception as exc:
+            print("WARNING: Could not resolve workshop title from Steam: {0}".format(exc))
+            resolved = None
+        return resolved or "Workshop item {0}".format(content_id)
+
+    def download_workshop_content_one_shot(self, paths, has_config, config, database, args):
+        if not has_config:
+            print("No configuration was found. Running bootstrap first.")
+            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+
+        options = self.parse_one_shot_download_args(args)
+        if options["anonymous"] is not None:
+            config["Defaults"]["UseAnonymousSteam"] = options["anonymous"]
+
+        game = self.find_game_by_app_id(database, options["app_id"])
+        game_type_id = (
+            options["game_type_id"]
+            or (game.get("GameTypeId") if game else None)
+            or config["Defaults"].get("GameTypeId")
+        )
+        if game_type_id not in self.supported_game_type_ids():
+            raise ValueError("Game type is not set. Use --type source2 or --type unreal5.")
+
+        game_title = options["game_title"] or (
+            game.get("Title") if game else self.resolve_game_title(options["app_id"])
+        )
+        if game:
+            if options["game_title"] or game.get("GameTypeId") != game_type_id:
+                game = database.update_game(
+                    game["Id"],
+                    game_title if options["game_title"] else game.get("Title"),
+                    game.get("AppId"),
+                    game_type_id,
+                )
+        else:
+            game = database.create_game(game_title, options["app_id"], game_type_id)
+
+        workshop_item = self.find_workshop_item_by_content_id(
+            database,
+            game["Id"],
+            options["content_id"],
+        )
+        workshop_title = options["workshop_title"] or (
+            workshop_item.get("Title")
+            if workshop_item
+            else self.resolve_workshop_title(options["content_id"])
+        )
+        if workshop_item:
+            if options["workshop_title"]:
+                workshop_item = database.update_workshop_content(
+                    workshop_item["Id"],
+                    workshop_title,
+                    workshop_item.get("ContentId"),
+                )
+        else:
+            workshop_item = database.create_workshop_content(
+                game["Id"],
+                workshop_title,
+                options["content_id"],
+            )
+
+        game, workshop_item, download_path = self.download_and_record_workshop_content(
+            paths,
+            config,
+            database,
+            game,
+            workshop_item,
+            prompt_for_game_type=False,
+            ensure_tools=options["ensure_tools"] and not self.no_tool_bootstrap,
+        )
+        self.print_file_inventory(download_path)
+        print()
+        print("Done.")
+
     def download_workshop_content(self, paths, has_config, config, database):
         if not has_config:
             print("No configuration was found. Running bootstrap first.")
@@ -864,7 +1500,7 @@ class WorkshopAnalysis:
             return
 
         game = self.select_or_create_game(config, database)
-        workshop_item = self.select_or_create_workshop_content(database, game)
+        workshop_item = self.select_or_create_workshop_content(config, database, game)
         game, workshop_item, download_path = self.download_and_record_workshop_content(
             paths,
             config,
@@ -881,6 +1517,9 @@ class WorkshopAnalysis:
             download_path,
         )
 
+        self.print_file_inventory(download_path)
+        self.offer_analysis_actions(config, game, workshop_item, download_path)
+
         print()
         print("Done.")
 
@@ -894,17 +1533,21 @@ class WorkshopAnalysis:
             print(
                 "[{0}] {1}".format(
                     index,
-                    self.describe_game_with_content(candidate["Game"], candidate["WorkshopItem"]),
+                    self.describe_game_with_content_status(
+                        candidate["Config"],
+                        candidate["Game"],
+                        candidate["WorkshopItem"],
+                    ),
                 )
             )
         print("[A] All listed workshop content")
         print("[B] Back")
 
         while True:
-            answer = input("Select items by number, comma-separated list, or A: ").strip().lower()
+            answer = input("Select items by number, comma-separated list, or A [A]: ").strip().lower()
             if answer in ("b", "back", "q", "quit"):
                 return []
-            if answer in ("a", "all"):
+            if answer in ("", "a", "all"):
                 return candidates
 
             selected = []
@@ -923,14 +1566,20 @@ class WorkshopAnalysis:
                 return selected
             print("WARNING: Invalid selection.")
 
-    def collect_update_candidates(self, database, game=None):
+    def collect_update_candidates(self, database, game=None, config=None):
         games = [game] if game else database.list_games()
         candidates = []
         for catalog_game in games:
             if not catalog_game:
                 continue
             for item in database.list_workshop_content(catalog_game["Id"]):
-                candidates.append({"Game": catalog_game, "WorkshopItem": item})
+                candidates.append(
+                    {
+                        "Config": config or self.new_default_config(),
+                        "Game": catalog_game,
+                        "WorkshopItem": item,
+                    }
+                )
         return candidates
 
     def update_catalog_downloads(self, paths, has_config, config, database):
@@ -948,14 +1597,14 @@ class WorkshopAnalysis:
             answer = input("Select update scope: ").strip().lower()
             if answer in ("b", "back", "q", "quit"):
                 return
-            if answer in ("a", "all"):
-                candidates = self.collect_update_candidates(database)
+            if answer in ("", "a", "all"):
+                candidates = self.collect_update_candidates(database, config=config)
                 break
             if answer in ("g", "game", "select"):
                 game = self.select_existing_game(database, "Update downloads for game")
                 if not game:
                     return
-                candidates = self.collect_update_candidates(database, game)
+                candidates = self.collect_update_candidates(database, game, config)
                 break
             print("WARNING: Invalid selection.")
 
@@ -999,6 +1648,9 @@ class WorkshopAnalysis:
         print("  help           Show this command list.")
         print("  exit           Leave the command interpreter.")
         print()
+        print("One-shot download:")
+        print("  download <AppID> <WorkshopContentID> --type source2 --anonymous")
+        print()
         print("Aliases: run=download, refresh=update, manage=inventory=catalog, quit=exit, ?=help")
 
     @staticmethod
@@ -1014,6 +1666,182 @@ class WorkshopAnalysis:
         print("SteamCMD: {0}".format(config["SteamCmd"].get("ExePath") or "not configured"))
         print("Games: {0}".format(len(games)))
         print("Workshop items: {0}".format(workshop_count))
+
+    @staticmethod
+    def truncate_text(value, width):
+        value = str(value)
+        if width <= 0 or len(value) <= width:
+            return value
+        if width <= 3:
+            return value[:width]
+        return "{0}...".format(value[: width - 3])
+
+    @staticmethod
+    def color_enabled():
+        return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    def color_text(self, value, color_name):
+        if not self.color_enabled():
+            return str(value)
+        color = self.ANSI_COLORS.get(color_name)
+        if not color:
+            return str(value)
+        return "{0}{1}{2}".format(color, value, self.ANSI_COLORS["reset"])
+
+    def accent_key(self, key):
+        return self.color_text("[{0}]".format(key), "cyan")
+
+    def status_text(self, value, healthy=True):
+        return self.color_text(value, "green" if healthy else "yellow")
+
+    def print_menu_item(self, key, title, detail="", color_name="cyan"):
+        key_text = self.color_text("[{0}]".format(key), color_name)
+        title_text = self.color_text(title, "bold")
+        if detail:
+            print("  {0}  {1}  {2}".format(key_text, title_text, self.color_text(detail, "muted")))
+        else:
+            print("  {0}  {1}".format(key_text, title_text))
+
+    def print_terminal_header(self, title, subtitle=None):
+        width = shutil.get_terminal_size((100, 30)).columns
+        print(self.color_text(title, "bold"))
+        if subtitle:
+            print(self.color_text(subtitle, "muted"))
+        print(self.color_text("=" * min(width, 80), "blue"))
+
+    @staticmethod
+    def enable_terminal_ui():
+        if not sys.stdout.isatty() or not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass
+
+    @staticmethod
+    def clear_terminal():
+        if sys.stdout.isatty():
+            print("\033[2J\033[H", end="")
+
+    @staticmethod
+    def read_terminal_action():
+        if sys.stdin.isatty() and sys.stdout.isatty() and sys.platform.startswith("win"):
+            try:
+                import msvcrt
+
+                print("Select action: ", end="", flush=True)
+                key = msvcrt.getwch()
+                if key in ("\x00", "\xe0"):
+                    key = msvcrt.getwch()
+                print(key)
+                return key.strip()
+            except Exception:
+                pass
+        return input("Select action or command: ").strip()
+
+    @staticmethod
+    def pause_terminal_ui():
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return
+        if sys.platform.startswith("win"):
+            try:
+                import msvcrt
+
+                print()
+                print("Press any key to return to WorkshopAnalysis...", end="", flush=True)
+                msvcrt.getwch()
+                print()
+                return
+            except Exception:
+                pass
+        input("\nPress Enter to return to WorkshopAnalysis...")
+
+    def render_terminal_ui_home(self, paths, config, database):
+        self.clear_terminal()
+        games = database.list_games()
+        workshop_count = sum(int(game.get("WorkshopContentCount") or 0) for game in games)
+        width = shutil.get_terminal_size((100, 30)).columns
+
+        steamcmd_path = as_path(config.get("SteamCmd", {}).get("ExePath"))
+        steamcmd_status = "ready" if steamcmd_path and steamcmd_path.exists() else "not configured"
+        default_type = config.get("Defaults", {}).get("GameTypeId") or "not set"
+
+        self.print_terminal_header("WorkshopAnalysis", "Steam Workshop catalog and inspection workspace")
+        print(
+            "{0} {1}   {2} {3}   {4} {5}   {6} {7}".format(
+                self.color_text("Games:", "muted"),
+                len(games),
+                self.color_text("Workshop items:", "muted"),
+                workshop_count,
+                self.color_text("Default type:", "muted"),
+                default_type,
+                self.color_text("SteamCMD:", "muted"),
+                self.status_text(steamcmd_status, steamcmd_status == "ready"),
+            )
+        )
+        print("{0} {1}".format(self.color_text("State:", "muted"), paths["ConfigPath"].parent))
+        print()
+        print(self.color_text("Primary Actions", "bold"))
+        self.print_menu_item("D", "Download", "choose game/workshop content and install it", "green")
+        self.print_menu_item("U", "Update", "refresh all or selected catalog downloads", "yellow")
+        self.print_menu_item("C", "Catalog", "add, edit, remove, or install content", "cyan")
+        print()
+        print(self.color_text("Utilities", "bold"))
+        self.print_menu_item("S", "Status", "show config, database, and counts", "blue")
+        self.print_menu_item("B", "Bootstrap", "run setup or reconfigure defaults", "magenta")
+        self.print_menu_item("H", "Help", "show command reference", "white")
+        self.print_menu_item(":", "Command", "type a one-off command", "white")
+        self.print_menu_item("Q", "Quit", "leave WorkshopAnalysis", "red")
+
+        rows = []
+        for game in games:
+            for item in database.list_workshop_content(game["Id"]):
+                rows.append((item.get("LastDownloadUtc") or "", game, item))
+        rows.sort(key=lambda row: row[0], reverse=True)
+
+        if rows:
+            print()
+            print(self.color_text("Recent Catalog Items", "bold"))
+            for _timestamp, game, item in rows[:8]:
+                status = self.describe_game_with_content_status(config, game, item)
+                print("  - {0}".format(self.truncate_text(status, max(40, width - 6))))
+        else:
+            print()
+            print(self.color_text("Recent Catalog Items", "bold"))
+            print("  {0}".format(self.color_text("No workshop content is cataloged yet.", "muted")))
+
+        print()
+        print(self.color_text("Tip: .\\WorkshopAnalysis --raw keeps the line-oriented interpreter.", "muted"))
+
+    def tokens_for_terminal_action(self, action, has_config):
+        normalized = action.strip()
+        lowered = normalized.lower()
+        if not normalized:
+            return []
+        if lowered in ("q", "quit", "exit"):
+            return ["exit"]
+        if lowered in ("d", "1"):
+            return ["download"]
+        if lowered in ("u", "2"):
+            return ["update"]
+        if lowered in ("c", "3"):
+            return ["catalog"]
+        if lowered in ("s", "4"):
+            return ["status"]
+        if lowered in ("b", "5"):
+            return ["reconfigure" if has_config else "bootstrap"]
+        if lowered in ("h", "?", "6"):
+            return ["help"]
+        if lowered in (":", ";"):
+            command = input("Command: ").strip()
+            return shlex.split(command) if command else []
+        return shlex.split(normalized)
 
     def execute_command(self, tokens):
         if isinstance(tokens, str):
@@ -1037,7 +1865,16 @@ class WorkshopAnalysis:
             return True
 
         if command in ("download", "run"):
-            self.download_workshop_content(paths, has_config, config, database)
+            if len(tokens) > 1:
+                self.download_workshop_content_one_shot(
+                    paths,
+                    has_config,
+                    config,
+                    database,
+                    tokens[1:],
+                )
+            else:
+                self.download_workshop_content(paths, has_config, config, database)
             return True
 
         if command in ("update", "refresh"):
@@ -1045,7 +1882,7 @@ class WorkshopAnalysis:
             return True
 
         if command in ("catalog", "manage", "inventory"):
-            self.manage_catalog(config, database)
+            self.manage_catalog(config, database, paths)
             return True
 
         if command == "status":
@@ -1085,7 +1922,52 @@ class WorkshopAnalysis:
             if not should_continue:
                 return
 
-    def run(self, commands=None, bootstrap=False, reconfigure=False, manage_catalog=False):
+    def run_terminal_ui(self):
+        self.enable_terminal_ui()
+        paths, has_config, config, database = self.load_runtime()
+        if not has_config:
+            self.clear_terminal()
+            print("No configuration was found. Starting initial setup.")
+            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+            self.pause_terminal_ui()
+
+        while True:
+            paths, has_config, config, database = self.load_runtime()
+            self.render_terminal_ui_home(paths, config, database)
+            try:
+                action = self.read_terminal_action()
+                tokens = self.tokens_for_terminal_action(action, has_config)
+            except EOFError:
+                print()
+                return
+            except ValueError as exc:
+                self.clear_terminal()
+                print("ERROR: {0}".format(exc), file=sys.stderr)
+                self.pause_terminal_ui()
+                continue
+
+            if not tokens:
+                continue
+
+            if tokens[0].strip().lower() in ("exit", "quit"):
+                return
+
+            self.clear_terminal()
+            try:
+                should_continue = self.execute_command(tokens)
+            except ValueError as exc:
+                print("ERROR: {0}".format(exc), file=sys.stderr)
+                should_continue = True
+            except Exception as exc:
+                print("ERROR: {0}".format(exc), file=sys.stderr)
+                should_continue = True
+
+            if not should_continue:
+                return
+
+            self.pause_terminal_ui()
+
+    def run(self, commands=None, bootstrap=False, reconfigure=False, manage_catalog=False, raw_mode=False):
         if bootstrap:
             commands = ["bootstrap"]
         elif reconfigure:
@@ -1097,4 +1979,7 @@ class WorkshopAnalysis:
             self.execute_command(commands)
             return
 
-        self.run_shell()
+        if raw_mode:
+            self.run_shell()
+        else:
+            self.run_terminal_ui()

@@ -232,7 +232,7 @@ class BootstrapAndRunTests(WorkshopAnalysisTestCase):
         ), mock.patch("subprocess.run", side_effect=fake_steamcmd):
             self.run_quietly(
                 lambda: app.run(commands=["download"]),
-                inputs=["n", "123", "", "1", "n", "456", ""],
+                inputs=["n", "123", "", "1", "n", "456", "", ""],
             )
 
         db = wa.WorkshopDatabase(paths["DbPath"])
@@ -273,6 +273,7 @@ class CatalogManagementTests(WorkshopAnalysisTestCase):
                     "a",
                     "222",
                     "Item A",
+                    "n",
                     "1",
                     "e",
                     "Item B",
@@ -296,6 +297,44 @@ class CatalogManagementTests(WorkshopAnalysisTestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["Title"], "Item B")
         self.assertEqual(items[0]["ContentId"], "333")
+
+    def test_add_workshop_content_can_install_immediately(self):
+        app = self.app(no_tool_bootstrap=True)
+        paths = app.state_paths()
+        config = self.config(app)
+        Path(config["SteamCmd"]["ExePath"]).parent.mkdir(parents=True)
+        Path(config["SteamCmd"]["ExePath"]).write_text("", encoding="utf-8")
+        wa.save_json_file(paths["ConfigPath"], config)
+
+        db = self.database()
+        game = db.create_game("Game", "100", "source2")
+
+        def fake_steamcmd(command, check=False, **kwargs):
+            content_dir = (
+                Path(config["Defaults"]["WorkshopDownloadRoot"])
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / "100"
+                / "200"
+            )
+            content_dir.mkdir(parents=True, exist_ok=True)
+            (content_dir / "pak01_dir.vpk").write_text("vpk", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="Success. Downloaded item")
+
+        with mock.patch(
+            "workshop_analysis_app.app.get_steam_workshop_item_title",
+            return_value=None,
+        ), mock.patch("subprocess.run", side_effect=fake_steamcmd):
+            self.run_quietly(
+                lambda: app.add_workshop_content(paths, config, db, game),
+                inputs=["200", "Item", "y", ""],
+            )
+
+        items = db.list_workshop_content(game["Id"])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["Title"], "Item")
+        self.assertTrue(Path(items[0]["LastDownloadPath"]).exists())
 
     def test_delete_workshop_content_purges_installed_directory_and_database_row(self):
         app = self.app()
@@ -629,6 +668,20 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         self.assertTrue(fallback_config["Tools"]["Source2"]["Installed"])
         self.assertEqual(fallback_config["Tools"]["Source2"]["CliPath"], str(manual_path))
 
+    def test_source2_tool_setup_uses_native_architecture_asset(self):
+        app = self.app()
+        with mock.patch.dict(
+            "workshop_analysis_app.app.os.environ",
+            {"PROCESSOR_ARCHITECTURE": "AMD64"},
+            clear=True,
+        ), mock.patch("workshop_analysis_app.app.platform.machine", return_value="AMD64"):
+            architecture = app.detect_cpu_architecture()
+
+        self.assertEqual(architecture, "x64")
+        asset_regex = app.source2_asset_regex_for_arch(architecture)
+        self.assertRegex("cli-windows-x64.zip", asset_regex)
+        self.assertNotRegex("cli-windows-arm64.zip", asset_regex)
+
     def test_unreal_tool_setup_manual_retoc_and_unrealpak(self):
         app = self.app()
         config = self.config(app)
@@ -686,9 +739,12 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
             / "200"
         )
         primary_path.mkdir(parents=True)
+        output = io.StringIO()
         with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=7)) as run:
-            resolved = self.run_quietly(lambda: app.invoke_workshop_download(config, game, item))
+            with redirect_stdout(output):
+                resolved = app.invoke_workshop_download(config, game, item)
         self.assertEqual(resolved, primary_path)
+        self.assertNotIn("SteamCMD exited with code 7", output.getvalue())
         command = run.call_args.args[0]
         self.assertLess(command.index("+force_install_dir"), command.index("+login"))
 
@@ -700,6 +756,135 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         exe.unlink()
         with self.assertRaises(RuntimeError):
             app.invoke_workshop_download(config, game, item)
+
+    def test_steamcmd_status_runner_suppresses_output_unless_debug_enabled(self):
+        command = ["steamcmd.exe", "+quit"]
+        steam_output = "Downloading item 200 ...\nSuccess. Downloaded item 200\n"
+
+        quiet_app = self.app()
+        quiet_output = io.StringIO()
+        with mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=steam_output),
+        ):
+            with redirect_stdout(quiet_output):
+                quiet_app.run_steamcmd_with_status(command, "Running SteamCMD")
+        self.assertIn("Running SteamCMD", quiet_output.getvalue())
+        self.assertIn("SteamCMD completed.", quiet_output.getvalue())
+        self.assertNotIn("Downloading item 200", quiet_output.getvalue())
+
+        debug_app = wa.WorkshopAnalysis(self.temp_dir / "debug-state", debug=True)
+        debug_output = io.StringIO()
+        with mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=steam_output),
+        ):
+            with redirect_stdout(debug_output):
+                debug_app.run_steamcmd_with_status(command, "Running SteamCMD")
+        self.assertIn("Downloading item 200", debug_output.getvalue())
+
+    def test_file_inventory_detects_packages_metadata_and_suspicious_files(self):
+        app = self.app()
+        content_dir = self.temp_dir / "content"
+        (content_dir / "sub").mkdir(parents=True)
+        (content_dir / "pak01_dir.vpk").write_text("vpk", encoding="utf-8")
+        (content_dir / "publish_data.txt").write_text("metadata", encoding="utf-8")
+        (content_dir / "sub" / "installer.exe").write_text("exe", encoding="utf-8")
+
+        inventory = app.build_file_inventory(content_dir)
+
+        self.assertEqual(inventory["FileCount"], 3)
+        self.assertEqual(inventory["Extensions"][".vpk"], 1)
+        self.assertIn("pak01_dir.vpk", inventory["ArchiveFiles"])
+        self.assertIn("publish_data.txt", inventory["InterestingMetadata"])
+        self.assertIn(str(Path("sub") / "installer.exe"), inventory["SuspiciousFiles"])
+
+    def test_catalog_status_badges_include_download_tool_and_analysis_state(self):
+        app = self.app()
+        config = self.config(app)
+        tool_path = self.temp_dir / "tools" / "source2" / "Source2Viewer-CLI.exe"
+        tool_path.parent.mkdir(parents=True)
+        tool_path.write_text("exe", encoding="utf-8")
+        config["Tools"]["Source2"]["CliPath"] = str(tool_path)
+        config["Tools"]["Source2"]["Installed"] = True
+
+        content_dir = self.temp_dir / "downloaded"
+        (content_dir / ".workshop_analysis").mkdir(parents=True)
+        (content_dir / ".workshop_analysis" / "analysis_complete").write_text("", encoding="utf-8")
+        (content_dir / "pak01_dir.vpk").write_text("vpk", encoding="utf-8")
+
+        game = {"Title": "Game", "AppId": "100", "GameTypeId": "source2"}
+        item = {
+            "Title": "Item",
+            "ContentId": "200",
+            "LastDownloadPath": str(content_dir),
+            "LastDownloadUtc": "2026-06-24T12:34:56Z",
+        }
+
+        status = app.describe_workshop_content_status(config, game, item)
+
+        self.assertIn("[downloaded]", status)
+        self.assertIn("[tool ready]", status)
+        self.assertIn("[needs extraction]", status)
+        self.assertIn("[analysis complete]", status)
+        self.assertIn("[last updated 2026-06-24 12:34]", status)
+
+    def test_one_shot_download_creates_catalog_entries_and_prints_inventory(self):
+        app = self.app(no_tool_bootstrap=True)
+        paths = app.state_paths()
+        config = self.config(app)
+        Path(config["SteamCmd"]["ExePath"]).parent.mkdir(parents=True)
+        Path(config["SteamCmd"]["ExePath"]).write_text("", encoding="utf-8")
+        wa.save_json_file(paths["ConfigPath"], config)
+        db = self.database()
+
+        def fake_steamcmd(command, check=False, **kwargs):
+            self.assertIn("+workshop_download_item", command)
+            self.assertEqual(command[command.index("+login") + 1], "anonymous")
+            app_id = command[command.index("+workshop_download_item") + 1]
+            content_id = command[command.index("+workshop_download_item") + 2]
+            content_dir = (
+                Path(config["Defaults"]["WorkshopDownloadRoot"])
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / app_id
+                / content_id
+            )
+            content_dir.mkdir(parents=True, exist_ok=True)
+            (content_dir / "pak01_dir.vpk").write_text("vpk", encoding="utf-8")
+            (content_dir / "publish_data.txt").write_text("metadata", encoding="utf-8")
+            return SimpleNamespace(returncode=7, stdout="Success. Downloaded item")
+
+        output = io.StringIO()
+        with mock.patch(
+            "workshop_analysis_app.app.get_steam_app_title",
+            return_value=CS2_GAME_TITLE,
+        ), mock.patch(
+            "workshop_analysis_app.app.get_steam_workshop_item_title",
+            return_value=CS2_WORKSHOP_ITEMS[0]["Title"],
+        ), mock.patch("subprocess.run", side_effect=fake_steamcmd):
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                app.run(
+                    commands=[
+                        "download",
+                        CS2_APP_ID,
+                        CS2_WORKSHOP_ITEMS[0]["ContentId"],
+                        "--type",
+                        "source2",
+                        "--anonymous",
+                    ]
+                )
+
+        games = db.list_games()
+        self.assertEqual(games[0]["Title"], CS2_GAME_TITLE)
+        items = db.list_workshop_content(games[0]["Id"])
+        self.assertEqual(items[0]["Title"], CS2_WORKSHOP_ITEMS[0]["Title"])
+        self.assertTrue(Path(items[0]["LastDownloadPath"]).exists())
+        self.assertIn("Downloaded file inventory", output.getvalue())
+        self.assertIn("Detected package files: .vpk=1", output.getvalue())
+        self.assertIn("publish_data.txt", output.getvalue())
+        self.assertNotIn("SteamCMD exited with code 7", output.getvalue())
 
     def test_update_catalog_downloads_all_and_selected_workshop_items(self):
         app = self.app(no_tool_bootstrap=True)
@@ -735,7 +920,7 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         with mock.patch("subprocess.run", side_effect=fake_steamcmd):
             self.run_quietly(
                 lambda: app.update_catalog_downloads(paths, True, config, db),
-                inputs=["a", "a"],
+                inputs=["", ""],
             )
 
         self.assertEqual(downloaded, [("100", "200"), ("101", "201")])
@@ -824,7 +1009,7 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         with mock.patch("subprocess.run", side_effect=fake_steamcmd):
             self.run_quietly(
                 lambda: app.update_catalog_downloads(paths, True, config, db),
-                inputs=["a", "a"],
+                inputs=["", ""],
             )
 
         self.assertEqual(len(commands), len(CS2_WORKSHOP_ITEMS))
@@ -856,6 +1041,47 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
                 self.assertEqual(wa.main(["--state-root", str(self.temp_dir / "state"), "catalog"]), 0)
         self.assertEqual(run.call_args.kwargs["commands"], ["catalog"])
 
+        with mock.patch.object(wa.WorkshopAnalysis, "run", return_value=None) as run:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    wa.main(
+                        [
+                            "--state-root",
+                            str(self.temp_dir / "state"),
+                            "download",
+                            CS2_APP_ID,
+                            CS2_WORKSHOP_ITEMS[0]["ContentId"],
+                            "--type",
+                            "source2",
+                            "--anonymous",
+                        ]
+                    ),
+                    0,
+                )
+        self.assertEqual(
+            run.call_args.kwargs["commands"],
+            [
+                "download",
+                CS2_APP_ID,
+                CS2_WORKSHOP_ITEMS[0]["ContentId"],
+                "--type",
+                "source2",
+                "--anonymous",
+            ],
+        )
+
+        with mock.patch.object(wa.WorkshopAnalysis, "run", return_value=None) as run:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(wa.main(["--raw"]), 0)
+        self.assertTrue(run.call_args.kwargs["raw_mode"])
+
+        with mock.patch("workshop_analysis_app.cli.WorkshopAnalysis") as app_class:
+            app_class.return_value.run.return_value = None
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(wa.main(["--debug", "status"]), 0)
+        self.assertTrue(app_class.call_args.kwargs["debug"])
+        self.assertEqual(app_class.return_value.run.call_args.kwargs["commands"], ["status"])
+
         with mock.patch.object(wa.WorkshopAnalysis, "run", side_effect=KeyboardInterrupt):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(wa.main(["--state-root", str(self.temp_dir / "state")]), 130)
@@ -868,6 +1094,23 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         app = self.app()
         wa.save_json_file(app.state_paths()["ConfigPath"], self.config(app))
         self.run_quietly(app.run_shell, inputs=["help", "exit"])
+
+    def test_run_uses_terminal_ui_by_default_and_raw_shell_when_requested(self):
+        app = self.app()
+        with mock.patch.object(app, "run_terminal_ui") as terminal_ui, mock.patch.object(app, "run_shell") as raw_shell:
+            app.run()
+        terminal_ui.assert_called_once_with()
+        raw_shell.assert_not_called()
+
+        with mock.patch.object(app, "run_terminal_ui") as terminal_ui, mock.patch.object(app, "run_shell") as raw_shell:
+            app.run(raw_mode=True)
+        raw_shell.assert_called_once_with()
+        terminal_ui.assert_not_called()
+
+    def test_terminal_ui_can_dispatch_status_and_exit(self):
+        app = self.app()
+        wa.save_json_file(app.state_paths()["ConfigPath"], self.config(app))
+        self.run_quietly(app.run_terminal_ui, inputs=["s", "q"])
 
     def test_shell_runs_initial_bootstrap_when_config_is_missing(self):
         app = self.app()

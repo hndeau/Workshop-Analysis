@@ -56,24 +56,37 @@ After setup, use `.\WorkshopAnalysis` directly for future runs. The first interp
 
 ## Running
 
-Open the command interpreter:
+Open Workshop Analysis:
 
 ```powershell
 .\WorkshopAnalysis
 ```
 
-If this is the first run and `state\config.json` does not exist, the interpreter starts initial setup before showing the command prompt.
+By default, this opens an in-place terminal UI that redraws a color-coded dashboard and action menu instead of appending every command prompt to the terminal history. If this is the first run and `state\config.json` does not exist, the UI starts initial setup before showing the dashboard.
 
-Inside the interpreter, use commands:
+Use the action keys shown in the UI, or press `:` to type a command directly. Common commands are:
 
 ```text
 WorkshopAnalysis> help
 WorkshopAnalysis> bootstrap
 WorkshopAnalysis> download
+WorkshopAnalysis> download 730 3735111145 --type source2 --anonymous
 WorkshopAnalysis> update
 WorkshopAnalysis> catalog
 WorkshopAnalysis> status
 WorkshopAnalysis> exit
+```
+
+To preserve the original raw text input/output interpreter:
+
+```powershell
+.\WorkshopAnalysis --raw
+```
+
+Normal operation suppresses routine SteamCMD chatter and shows a concise running status/spinner during downloads. To show raw SteamCMD output while diagnosing a problem:
+
+```powershell
+.\WorkshopAnalysis --debug download 730 3735111145 --type source2 --anonymous
 ```
 
 Use `reconfigure` later to revisit bootstrap settings without deleting catalog data.
@@ -82,16 +95,32 @@ Use `reconfigure` later to revisit bootstrap settings without deleting catalog d
 
 When adding games, enter the Steam AppID first. The tool attempts to resolve the game title from Steam app metadata and uses it as the title default. When adding workshop content, enter the Workshop ContentID first. The tool attempts to resolve the workshop title from Steam's published-file metadata and uses it as the title default. Manual title entry remains available when either lookup is unavailable or incorrect.
 
-Use `update` to re-download cataloged workshop content. It can update all workshop items, selected workshop items across the catalog, or selected items for one game.
+Use `update` to re-download cataloged workshop content. It can update all workshop items, selected workshop items across the catalog, or selected items for one game. Blank input accepts obvious defaults; in update selection, blank input selects all listed workshop content.
+
+After a download, Workshop Analysis prints a file inventory with file count, total size, extension counts, detected VPK/pak/utoc/ucas package files, interesting metadata such as `publish_data.txt`, and executable/script-like files worth reviewing. The guided flow then offers inline actions:
+
+```text
+[E] Extract
+[L] List contents
+[D] Decompile/convert
+[R] Run scan
+[O] Open folder
+[B] Back
+```
+
+The extract and decompile/convert actions currently keep the configured tool paths and next steps inside the tool while deeper Source 2 / UE5 automation is still being built.
 
 You can also run one command and exit, similar to tools like SBT:
 
 ```powershell
 .\WorkshopAnalysis download
+.\WorkshopAnalysis download 730 3735111145 --type source2 --anonymous
 .\WorkshopAnalysis update
 .\WorkshopAnalysis catalog
 .\WorkshopAnalysis status
 ```
+
+The one-shot download form creates or reuses catalog entries, resolves Steam titles when available, downloads the workshop item, records download metadata, and prints the same file inventory without opening the interactive action menu. Optional flags include `--type source2`, `--type unreal5`, `--anonymous`, `--no-anonymous`, `--game-title`, `--title` / `--workshop-title`, and `--with-tools`.
 
 Use a custom state directory:
 
@@ -105,6 +134,8 @@ Skip optional Source 2 / UE5 tool checks for download commands:
 .\WorkshopAnalysis --no-tool-bootstrap download
 ```
 
+When installing Source 2 Viewer CLI, the tool detects the local CPU architecture and selects the matching release asset, for example `cli-windows-x64.zip` on typical Windows Sandbox and x64 VM installs.
+
 ## Catalog Management
 
 Open the catalog manager from the interpreter:
@@ -117,6 +148,8 @@ The catalog manager supports:
 
 - Add, edit, and remove games.
 - Add, edit, and remove workshop content associated with a game.
+- Prompt to download/install newly added workshop content immediately.
+- Status badges for workshop items, including downloaded/not downloaded, tool ready, needs extraction, analysis complete, and last updated.
 - Re-download all or selected workshop content with the `update` command.
 - Purge downloaded workshop content when removing a workshop item.
 - Purge all associated workshop content when removing a game.
