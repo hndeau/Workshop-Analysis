@@ -20,7 +20,12 @@ from .common import (
 )
 from .database import WorkshopDatabase
 from .prompts import prompt_choice, prompt_non_empty, prompt_yes_no
-from .tooling import download_file, install_zip_tool_from_github
+from .tooling import (
+    download_file,
+    get_steam_app_title,
+    get_steam_workshop_item_title,
+    install_zip_tool_from_github,
+)
 
 
 class WorkshopAnalysis:
@@ -100,6 +105,17 @@ class WorkshopAnalysis:
             item.get("ContentId"),
             downloaded,
         )
+
+    @staticmethod
+    def describe_game_with_content(game, item):
+        return "{0} / {1}".format(
+            game.get("Title"),
+            WorkshopAnalysis.describe_workshop_content(item),
+        )
+
+    @staticmethod
+    def supported_game_type_ids():
+        return {game_type["Id"] for game_type in SUPPORTED_GAME_TYPES}
 
     @staticmethod
     def workshop_content_paths(config, game, workshop_item):
@@ -354,8 +370,7 @@ class WorkshopAnalysis:
 
     def add_game(self, config, database):
         write_section("Add game")
-        title = prompt_non_empty("Game title")
-        app_id = prompt_non_empty("Steam AppID")
+        app_id, title = self.prompt_game_fields()
         game_type = prompt_choice(
             "Game type analysis",
             SUPPORTED_GAME_TYPES,
@@ -365,10 +380,49 @@ class WorkshopAnalysis:
         print("Added game: {0}".format(self.describe_game(game)))
         return game
 
+    def prompt_game_fields(self, game=None):
+        existing_app_id = game.get("AppId") if game else None
+        existing_title = game.get("Title") if game else None
+        app_id = prompt_non_empty("Steam AppID", existing_app_id)
+
+        title_default = existing_title
+        if str(app_id) != str(existing_app_id) or not title_default:
+            try:
+                resolved_title = get_steam_app_title(app_id)
+            except Exception as exc:
+                print("WARNING: Could not resolve game title from Steam: {0}".format(exc))
+                resolved_title = None
+
+            if resolved_title:
+                print("Resolved game title: {0}".format(resolved_title))
+                title_default = resolved_title
+
+        title = prompt_non_empty("Game title", title_default)
+        return app_id, title
+
+    def prompt_game_type_for_game(self, config, database, game):
+        game_type_id = game.get("GameTypeId")
+        if game_type_id in self.supported_game_type_ids():
+            return game
+
+        write_section("Game type analysis")
+        print("Game: {0} ({1})".format(game.get("Title"), game.get("AppId")))
+        game_type = prompt_choice(
+            "Select analysis type for this game",
+            SUPPORTED_GAME_TYPES,
+            default_id=config["Defaults"].get("GameTypeId"),
+        )
+        updated = database.update_game(
+            game["Id"],
+            game.get("Title"),
+            game.get("AppId"),
+            game_type["Id"],
+        )
+        return updated
+
     def edit_game(self, config, database, game):
         write_section("Edit game")
-        title = prompt_non_empty("Game title", game.get("Title"))
-        app_id = prompt_non_empty("Steam AppID", game.get("AppId"))
+        app_id, title = self.prompt_game_fields(game)
         game_type = prompt_choice(
             "Game type analysis",
             SUPPORTED_GAME_TYPES,
@@ -401,11 +455,24 @@ class WorkshopAnalysis:
 
     def add_workshop_content(self, database, game):
         write_section("Add workshop content")
-        title = prompt_non_empty("Workshop content title")
-        content_id = prompt_non_empty("Workshop ContentID")
+        content_id, title = self.prompt_workshop_content_fields()
         item = database.create_workshop_content(game["Id"], title, content_id)
         print("Added workshop content: {0}".format(self.describe_workshop_content(item)))
         return item
+
+    def prompt_workshop_content_fields(self):
+        content_id = prompt_non_empty("Workshop ContentID")
+        title_default = None
+        try:
+            title_default = get_steam_workshop_item_title(content_id)
+        except Exception as exc:
+            print("WARNING: Could not resolve workshop title from Steam: {0}".format(exc))
+
+        if title_default:
+            print("Resolved workshop title: {0}".format(title_default))
+
+        title = prompt_non_empty("Workshop content title", title_default)
+        return content_id, title
 
     def edit_workshop_content(self, database, item):
         write_section("Edit workshop content")
@@ -538,22 +605,26 @@ class WorkshopAnalysis:
                 continue
             print("WARNING: Invalid selection.")
 
-    def select_or_create_game(self, config, database, game_type_id):
+    def select_or_create_game(self, config, database, game_type_id=None):
         write_section("Game entry")
         games = database.list_games()
 
         if games:
             for index, game in enumerate(games, start=1):
-                print("[{0}] {1} ({2})".format(index, game.get("Title"), game.get("AppId")))
+                print("[{0}] {1}".format(index, self.describe_game(game)))
         print("[N] New game entry")
         print("[M] Manage game catalog")
 
         while True:
             answer = input("Select a game or N: ").strip()
             if answer.lower() in ("n", "new"):
-                title = prompt_non_empty("Game title")
-                app_id = prompt_non_empty("Steam AppID")
-                return database.create_game(title, app_id, game_type_id)
+                app_id, title = self.prompt_game_fields()
+                game_type = prompt_choice(
+                    "Game type analysis",
+                    SUPPORTED_GAME_TYPES,
+                    default_id=game_type_id or config["Defaults"].get("GameTypeId"),
+                )
+                return database.create_game(title, app_id, game_type["Id"])
             if answer.lower() in ("m", "manage"):
                 self.manage_catalog(config, database)
                 return self.select_or_create_game(config, database, game_type_id)
@@ -564,10 +635,35 @@ class WorkshopAnalysis:
                 index = 0
             if 1 <= index <= len(games):
                 selected = games[index - 1]
-                if not selected.get("GameTypeId"):
+                if game_type_id and not selected.get("GameTypeId"):
                     database.update_game_type(selected["Id"], game_type_id)
                     selected["GameTypeId"] = game_type_id
-                return selected
+                    return selected
+                return self.prompt_game_type_for_game(config, database, selected)
+            print("WARNING: Invalid selection.")
+
+    def select_existing_game(self, database, title="Select game"):
+        games = database.list_games()
+        write_section(title)
+        if not games:
+            print("No games are in the catalog.")
+            return None
+
+        for index, game in enumerate(games, start=1):
+            print("[{0}] {1}".format(index, self.describe_game(game)))
+        print("[B] Back")
+
+        while True:
+            answer = input("Select a game: ").strip().lower()
+            if answer in ("b", "back", "q", "quit"):
+                return None
+
+            try:
+                index = int(answer)
+            except ValueError:
+                index = 0
+            if 1 <= index <= len(games):
+                return games[index - 1]
             print("WARNING: Invalid selection.")
 
     def select_or_create_workshop_content(self, database, game):
@@ -582,8 +678,7 @@ class WorkshopAnalysis:
         while True:
             answer = input("Select workshop content or N: ").strip()
             if answer.lower() in ("n", "new"):
-                title = prompt_non_empty("Workshop content title")
-                content_id = prompt_non_empty("Workshop ContentID")
+                content_id, title = self.prompt_workshop_content_fields()
                 return database.create_workshop_content(game["Id"], title, content_id)
 
             try:
@@ -606,7 +701,8 @@ class WorkshopAnalysis:
         workshop_download_root = Path(config["Defaults"]["WorkshopDownloadRoot"])
         ensure_directory(workshop_download_root)
 
-        if config["Defaults"].get("UseAnonymousSteam", True):
+        use_anonymous = config["Defaults"].get("UseAnonymousSteam", True)
+        if use_anonymous:
             login_args = ["+login", "anonymous"]
         else:
             print()
@@ -618,10 +714,12 @@ class WorkshopAnalysis:
             login_args = ["+login", steam_username]
 
         steamcmd_args = (
-            login_args
-            + [
+            [
                 "+force_install_dir",
                 str(workshop_download_root),
+            ]
+            + login_args
+            + [
                 "+workshop_download_item",
                 str(game["AppId"]),
                 str(workshop_item["ContentId"]),
@@ -638,9 +736,20 @@ class WorkshopAnalysis:
         )
         print("SteamCMD: {0}".format(steamcmd_path))
 
-        result = subprocess.run([str(steamcmd_path)] + steamcmd_args, check=False)
-        if result.returncode != 0:
-            raise RuntimeError("SteamCMD exited with code {0}.".format(result.returncode))
+        command = [str(steamcmd_path)] + steamcmd_args
+        if use_anonymous:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.print_steamcmd_output(getattr(result, "stdout", ""))
+        else:
+            result = subprocess.run(command, check=False)
 
         primary_path = (
             Path(steam_config["InstallDir"])
@@ -658,17 +767,47 @@ class WorkshopAnalysis:
             / str(game["AppId"])
             / str(workshop_item["ContentId"])
         )
+
         if primary_path.exists():
             download_path = primary_path
         elif alternate_path.exists():
             download_path = alternate_path
         else:
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "SteamCMD exited with code {0}, and downloaded content was not found under "
+                    "'{1}' or '{2}'.".format(result.returncode, primary_path, alternate_path)
+                )
             raise RuntimeError(
                 "SteamCMD completed, but downloaded content was not found under "
                 "'{0}' or '{1}'.".format(primary_path, alternate_path)
             )
 
+        if result.returncode != 0:
+            print(
+                "WARNING: SteamCMD exited with code {0}, but downloaded content was found. Continuing.".format(
+                    result.returncode
+                )
+            )
+
         return download_path
+
+    @staticmethod
+    def print_steamcmd_output(output):
+        if not output:
+            return
+
+        ignored_fragments = (
+            "Redirecting stderr to",
+            'ILocalize::AddFile() failed to load file "public/steambootstrapper_english.txt"',
+            "Failed to clear up temporary update files used for rollback, continuing anyway",
+            "Failed to clean up after update, continuing",
+            "CWorkThreadPool::~CWorkThreadPool: work processing queue not empty",
+        )
+        for line in output.splitlines():
+            if any(fragment in line for fragment in ignored_fragments):
+                continue
+            print(line)
 
     @staticmethod
     def invoke_analysis_todo(config, game_type_id, game, workshop_item, content_path):
@@ -702,23 +841,12 @@ class WorkshopAnalysis:
         database.migrate_legacy_json(paths["LegacyJsonDbPath"])
         return paths, has_config, config, database
 
-    def download_workshop_content(self, paths, has_config, config, database):
-        if not has_config:
-            print("No configuration was found. Running bootstrap first.")
-            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
-            return
+    def download_and_record_workshop_content(self, paths, config, database, game, workshop_item):
+        game = self.prompt_game_type_for_game(config, database, game)
+        game_type_id = game["GameTypeId"]
+        config["Defaults"]["GameTypeId"] = game_type_id
+        self.ensure_tools_for_game_type(config, game_type_id)
 
-        default_game_type_id = config["Defaults"].get("GameTypeId")
-        game_type = prompt_choice(
-            "Game type analysis",
-            SUPPORTED_GAME_TYPES,
-            default_id=default_game_type_id,
-        )
-        config["Defaults"]["GameTypeId"] = game_type["Id"]
-        self.ensure_tools_for_game_type(config, game_type["Id"])
-
-        game = self.select_or_create_game(config, database, game_type["Id"])
-        workshop_item = self.select_or_create_workshop_content(database, game)
         download_path = self.invoke_workshop_download(config, game, workshop_item)
         downloaded_at = utc_now_iso()
         database.update_workshop_download(workshop_item["Id"], downloaded_at, download_path)
@@ -727,10 +855,27 @@ class WorkshopAnalysis:
 
         self.update_config_timestamp(config)
         save_json_file(paths["ConfigPath"], config)
+        return game, workshop_item, download_path
+
+    def download_workshop_content(self, paths, has_config, config, database):
+        if not has_config:
+            print("No configuration was found. Running bootstrap first.")
+            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+            return
+
+        game = self.select_or_create_game(config, database)
+        workshop_item = self.select_or_create_workshop_content(database, game)
+        game, workshop_item, download_path = self.download_and_record_workshop_content(
+            paths,
+            config,
+            database,
+            game,
+            workshop_item,
+        )
 
         self.invoke_analysis_todo(
             config,
-            game_type["Id"],
+            game["GameTypeId"],
             game,
             workshop_item,
             download_path,
@@ -739,6 +884,108 @@ class WorkshopAnalysis:
         print()
         print("Done.")
 
+    def prompt_workshop_update_selection(self, candidates):
+        if not candidates:
+            print("No workshop content is available to update.")
+            return []
+
+        write_section("Workshop content update selection")
+        for index, candidate in enumerate(candidates, start=1):
+            print(
+                "[{0}] {1}".format(
+                    index,
+                    self.describe_game_with_content(candidate["Game"], candidate["WorkshopItem"]),
+                )
+            )
+        print("[A] All listed workshop content")
+        print("[B] Back")
+
+        while True:
+            answer = input("Select items by number, comma-separated list, or A: ").strip().lower()
+            if answer in ("b", "back", "q", "quit"):
+                return []
+            if answer in ("a", "all"):
+                return candidates
+
+            selected = []
+            seen = set()
+            parts = answer.replace(",", " ").split()
+            for part in parts:
+                try:
+                    index = int(part)
+                except ValueError:
+                    index = 0
+                if 1 <= index <= len(candidates) and index not in seen:
+                    selected.append(candidates[index - 1])
+                    seen.add(index)
+
+            if selected:
+                return selected
+            print("WARNING: Invalid selection.")
+
+    def collect_update_candidates(self, database, game=None):
+        games = [game] if game else database.list_games()
+        candidates = []
+        for catalog_game in games:
+            if not catalog_game:
+                continue
+            for item in database.list_workshop_content(catalog_game["Id"]):
+                candidates.append({"Game": catalog_game, "WorkshopItem": item})
+        return candidates
+
+    def update_catalog_downloads(self, paths, has_config, config, database):
+        if not has_config:
+            print("No configuration was found. Running bootstrap first.")
+            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+            return
+
+        write_section("Update catalog downloads")
+        print("[A] All games")
+        print("[G] Select a game")
+        print("[B] Back")
+
+        while True:
+            answer = input("Select update scope: ").strip().lower()
+            if answer in ("b", "back", "q", "quit"):
+                return
+            if answer in ("a", "all"):
+                candidates = self.collect_update_candidates(database)
+                break
+            if answer in ("g", "game", "select"):
+                game = self.select_existing_game(database, "Update downloads for game")
+                if not game:
+                    return
+                candidates = self.collect_update_candidates(database, game)
+                break
+            print("WARNING: Invalid selection.")
+
+        selected = self.prompt_workshop_update_selection(candidates)
+        if not selected:
+            print("No workshop content selected for update.")
+            return
+
+        updated = 0
+        for candidate in selected:
+            game = candidate["Game"]
+            workshop_item = candidate["WorkshopItem"]
+            print()
+            print(
+                "Updating {0}".format(
+                    self.describe_game_with_content(game, workshop_item)
+                )
+            )
+            self.download_and_record_workshop_content(
+                paths,
+                config,
+                database,
+                game,
+                workshop_item,
+            )
+            updated += 1
+
+        print()
+        print("Updated {0} workshop item(s).".format(updated))
+
     @staticmethod
     def print_command_help():
         print()
@@ -746,12 +993,13 @@ class WorkshopAnalysis:
         print("  bootstrap      Run first-time setup prompts and write configuration.")
         print("  reconfigure    Re-run bootstrap prompts and update configuration.")
         print("  download       Select a game/workshop item, download it, and show analysis next steps.")
+        print("  update         Re-download cataloged workshop content.")
         print("  catalog        Manage games and associated workshop content.")
         print("  status         Show state paths and catalog counts.")
         print("  help           Show this command list.")
         print("  exit           Leave the command interpreter.")
         print()
-        print("Aliases: run=download, manage=inventory=catalog, quit=exit, ?=help")
+        print("Aliases: run=download, refresh=update, manage=inventory=catalog, quit=exit, ?=help")
 
     @staticmethod
     def print_status(paths, config, database):
@@ -790,6 +1038,10 @@ class WorkshopAnalysis:
 
         if command in ("download", "run"):
             self.download_workshop_content(paths, has_config, config, database)
+            return True
+
+        if command in ("update", "refresh"):
+            self.update_catalog_downloads(paths, has_config, config, database)
             return True
 
         if command in ("catalog", "manage", "inventory"):

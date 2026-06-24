@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -15,6 +16,55 @@ def download_file(uri, out_file):
     with urllib.request.urlopen(request) as response:
         with out_file.open("wb") as target:
             shutil.copyfileobj(response, target)
+
+
+def get_steam_workshop_item_title(content_id):
+    data = urllib.parse.urlencode(
+        {
+            "itemcount": 1,
+            "publishedfileids[0]": str(content_id),
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    details = payload.get("response", {}).get("publishedfiledetails", [])
+    if not details:
+        return None
+
+    title = details[0].get("title")
+    if not title or not str(title).strip():
+        return None
+
+    return str(title).strip()
+
+
+def get_steam_app_title(app_id):
+    query = urllib.parse.urlencode({"appids": str(app_id)})
+    request = urllib.request.Request(
+        "https://store.steampowered.com/api/appdetails?{0}".format(query),
+        headers={"User-Agent": USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    details = payload.get(str(app_id), {})
+    if not details.get("success"):
+        return None
+
+    title = details.get("data", {}).get("name")
+    if not title or not str(title).strip():
+        return None
+
+    return str(title).strip()
 
 def get_github_latest_release_asset(repository, asset_name_regex):
     import re

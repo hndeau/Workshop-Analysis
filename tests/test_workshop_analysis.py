@@ -19,6 +19,30 @@ if str(PROJECT_ROOT) not in sys.path:
 import workshop_analysis as wa
 
 
+CS2_APP_ID = "730"
+CS2_GAME_TITLE = "CS2"
+CS2_WORKSHOP_ITEMS = [
+    {
+        "Size": "light",
+        "ContentId": "3735111145",
+        "Title": "Dual Berettas :: RGB-A (Cache Collection)",
+        "Url": "https://steamcommunity.com/sharedfiles/filedetails/?id=3735111145",
+    },
+    {
+        "Size": "medium",
+        "ContentId": "3437809122",
+        "Title": "Cache",
+        "Url": "https://steamcommunity.com/sharedfiles/filedetails/?id=3437809122",
+    },
+    {
+        "Size": "heavy",
+        "ContentId": "3691046714",
+        "Title": "Splinter",
+        "Url": "https://steamcommunity.com/sharedfiles/filedetails/?id=3691046714",
+    },
+]
+
+
 class WorkshopAnalysisTestCase(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp(prefix="workshop-analysis-test-"))
@@ -45,6 +69,14 @@ class WorkshopAnalysisTestCase(unittest.TestCase):
         with mock.patch("builtins.input", side_effect=list(inputs)):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 return callable_()
+
+    def create_cs2_catalog(self, db):
+        game = db.create_game(CS2_GAME_TITLE, CS2_APP_ID, "source2")
+        items = [
+            db.create_workshop_content(game["Id"], item["Title"], item["ContentId"])
+            for item in CS2_WORKSHOP_ITEMS
+        ]
+        return game, items
 
 
 class JsonAndDatabaseTests(WorkshopAnalysisTestCase):
@@ -177,8 +209,9 @@ class BootstrapAndRunTests(WorkshopAnalysisTestCase):
         Path(config["SteamCmd"]["ExePath"]).write_text("", encoding="utf-8")
         wa.save_json_file(paths["ConfigPath"], config)
 
-        def fake_steamcmd(command, check=False):
+        def fake_steamcmd(command, check=False, **kwargs):
             self.assertIn("+workshop_download_item", command)
+            self.assertLess(command.index("+force_install_dir"), command.index("+login"))
             content_dir = (
                 Path(config["Defaults"]["WorkshopDownloadRoot"])
                 / "steamapps"
@@ -187,13 +220,19 @@ class BootstrapAndRunTests(WorkshopAnalysisTestCase):
                 / "123"
                 / "456"
             )
-            content_dir.mkdir(parents=True)
+            content_dir.mkdir(parents=True, exist_ok=True)
             return SimpleNamespace(returncode=0)
 
-        with mock.patch("subprocess.run", side_effect=fake_steamcmd):
+        with mock.patch(
+            "workshop_analysis_app.app.get_steam_app_title",
+            return_value="Test Game",
+        ), mock.patch(
+            "workshop_analysis_app.app.get_steam_workshop_item_title",
+            return_value="Test Item",
+        ), mock.patch("subprocess.run", side_effect=fake_steamcmd):
             self.run_quietly(
                 lambda: app.run(commands=["download"]),
-                inputs=["", "n", "Test Game", "123", "n", "Test Item", "456"],
+                inputs=["n", "123", "", "1", "n", "456", ""],
             )
 
         db = wa.WorkshopDatabase(paths["DbPath"])
@@ -219,30 +258,34 @@ class CatalogManagementTests(WorkshopAnalysisTestCase):
         db = self.database()
         config = self.config(app)
 
-        self.run_quietly(
-            lambda: app.manage_catalog(config, db),
-            inputs=[
-                "a",
-                "Game A",
-                "111",
-                "1",
-                "1",
-                "a",
-                "Item A",
-                "222",
-                "1",
-                "e",
-                "Item B",
-                "333",
-                "b",
-                "e",
-                "Game B",
-                "444",
-                "2",
-                "b",
-                "q",
-            ],
-        )
+        with mock.patch("workshop_analysis_app.app.get_steam_app_title", return_value=None), mock.patch(
+            "workshop_analysis_app.app.get_steam_workshop_item_title",
+            return_value=None,
+        ):
+            self.run_quietly(
+                lambda: app.manage_catalog(config, db),
+                inputs=[
+                    "a",
+                    "111",
+                    "Game A",
+                    "1",
+                    "1",
+                    "a",
+                    "222",
+                    "Item A",
+                    "1",
+                    "e",
+                    "Item B",
+                    "333",
+                    "b",
+                    "e",
+                    "444",
+                    "Game B",
+                    "2",
+                    "b",
+                    "q",
+                ],
+            )
 
         games = db.list_games()
         self.assertEqual(len(games), 1)
@@ -404,6 +447,69 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
             wa.download_file("https://example.test/file", target)
 
         self.assertEqual(target.read_bytes(), b"payload")
+
+    def test_steam_workshop_title_lookup_uses_published_file_details(self):
+        payload = {
+            "response": {
+                "publishedfiledetails": [
+                    {
+                        "publishedfileid": "3070193546",
+                        "result": 1,
+                        "title": "crashz' Crosshair Generator v4",
+                    }
+                ]
+            }
+        }
+
+        def fake_urlopen(request, timeout=None):
+            self.assertIn("GetPublishedFileDetails", request.full_url)
+            self.assertEqual(timeout, 10)
+            body = request.data.decode("utf-8")
+            self.assertIn("itemcount=1", body)
+            self.assertIn("publishedfileids%5B0%5D=3070193546", body)
+            return self.BytesResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            title = wa.get_steam_workshop_item_title("3070193546")
+
+        self.assertEqual(title, "crashz' Crosshair Generator v4")
+
+    def test_steam_workshop_title_lookup_returns_none_without_title(self):
+        payload = {"response": {"publishedfiledetails": [{"publishedfileid": "1"}]}}
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=self.BytesResponse(json.dumps(payload).encode("utf-8")),
+        ):
+            self.assertIsNone(wa.get_steam_workshop_item_title("1"))
+
+    def test_steam_app_title_lookup_uses_appdetails(self):
+        payload = {
+            "730": {
+                "success": True,
+                "data": {
+                    "name": "Counter-Strike 2",
+                },
+            }
+        }
+
+        def fake_urlopen(request, timeout=None):
+            self.assertIn("store.steampowered.com/api/appdetails", request.full_url)
+            self.assertIn("appids=730", request.full_url)
+            self.assertEqual(timeout, 10)
+            return self.BytesResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            title = wa.get_steam_app_title("730")
+
+        self.assertEqual(title, "Counter-Strike 2")
+
+    def test_steam_app_title_lookup_returns_none_without_successful_title(self):
+        payload = {"730": {"success": False}}
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=self.BytesResponse(json.dumps(payload).encode("utf-8")),
+        ):
+            self.assertIsNone(wa.get_steam_app_title("730"))
 
     def test_github_release_asset_selection_and_missing_asset_error(self):
         release = {
@@ -580,9 +686,11 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
             / "200"
         )
         primary_path.mkdir(parents=True)
-        with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
+        with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=7)) as run:
             resolved = self.run_quietly(lambda: app.invoke_workshop_download(config, game, item))
         self.assertEqual(resolved, primary_path)
+        command = run.call_args.args[0]
+        self.assertLess(command.index("+force_install_dir"), command.index("+login"))
 
         shutil.rmtree(primary_path)
         with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
@@ -592,6 +700,141 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         exe.unlink()
         with self.assertRaises(RuntimeError):
             app.invoke_workshop_download(config, game, item)
+
+    def test_update_catalog_downloads_all_and_selected_workshop_items(self):
+        app = self.app(no_tool_bootstrap=True)
+        paths = app.state_paths()
+        config = self.config(app)
+        Path(config["SteamCmd"]["ExePath"]).parent.mkdir(parents=True)
+        Path(config["SteamCmd"]["ExePath"]).write_text("", encoding="utf-8")
+        wa.save_json_file(paths["ConfigPath"], config)
+
+        db = self.database()
+        game_a = db.create_game("Game A", "100", "source2")
+        game_b = db.create_game("Game B", "101", "source2")
+        item_a = db.create_workshop_content(game_a["Id"], "Item A", "200")
+        item_b = db.create_workshop_content(game_b["Id"], "Item B", "201")
+
+        downloaded = []
+
+        def fake_steamcmd(command, check=False, **kwargs):
+            app_id = command[command.index("+workshop_download_item") + 1]
+            content_id = command[command.index("+workshop_download_item") + 2]
+            content_dir = (
+                Path(config["Defaults"]["WorkshopDownloadRoot"])
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / app_id
+                / content_id
+            )
+            content_dir.mkdir(parents=True, exist_ok=True)
+            downloaded.append((app_id, content_id))
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch("subprocess.run", side_effect=fake_steamcmd):
+            self.run_quietly(
+                lambda: app.update_catalog_downloads(paths, True, config, db),
+                inputs=["a", "a"],
+            )
+
+        self.assertEqual(downloaded, [("100", "200"), ("101", "201")])
+        self.assertTrue(Path(db.get_workshop_content(item_a["Id"])["LastDownloadPath"]).exists())
+        self.assertTrue(Path(db.get_workshop_content(item_b["Id"])["LastDownloadPath"]).exists())
+
+        downloaded.clear()
+        with mock.patch("subprocess.run", side_effect=fake_steamcmd):
+            self.run_quietly(
+                lambda: app.update_catalog_downloads(paths, True, config, db),
+                inputs=["g", "2", "1"],
+            )
+
+        self.assertEqual(downloaded, [("101", "201")])
+
+    def test_cs2_workshop_fixture_catalog_contains_known_anonymous_items(self):
+        app = self.app(no_tool_bootstrap=True)
+        db = self.database()
+        game, items = self.create_cs2_catalog(db)
+
+        self.assertEqual(game["AppId"], CS2_APP_ID)
+        self.assertEqual(game["GameTypeId"], "source2")
+        self.assertEqual(
+            [item["ContentId"] for item in items],
+            [item["ContentId"] for item in CS2_WORKSHOP_ITEMS],
+        )
+        self.assertEqual(
+            [item["Title"] for item in items],
+            [item["Title"] for item in CS2_WORKSHOP_ITEMS],
+        )
+        for item in CS2_WORKSHOP_ITEMS:
+            self.assertTrue(item["Url"].endswith("id={0}".format(item["ContentId"])))
+
+        candidates = app.collect_update_candidates(db)
+        self.assertEqual(len(candidates), 3)
+        self.assertEqual(
+            {
+                (
+                    candidate["Game"]["AppId"],
+                    candidate["WorkshopItem"]["ContentId"],
+                    candidate["WorkshopItem"]["Title"],
+                )
+                for candidate in candidates
+            },
+            {
+                (CS2_APP_ID, item["ContentId"], item["Title"])
+                for item in CS2_WORKSHOP_ITEMS
+            },
+        )
+
+    def test_cs2_workshop_fixture_updates_with_anonymous_steamcmd(self):
+        app = self.app(no_tool_bootstrap=True)
+        paths = app.state_paths()
+        config = self.config(app)
+        config["Defaults"]["UseAnonymousSteam"] = True
+        Path(config["SteamCmd"]["ExePath"]).parent.mkdir(parents=True)
+        Path(config["SteamCmd"]["ExePath"]).write_text("", encoding="utf-8")
+        wa.save_json_file(paths["ConfigPath"], config)
+
+        db = self.database()
+        self.create_cs2_catalog(db)
+
+        commands = []
+
+        def fake_steamcmd(command, check=False, **kwargs):
+            commands.append(command)
+            self.assertIn("+login", command)
+            self.assertEqual(command[command.index("+login") + 1], "anonymous")
+            self.assertLess(command.index("+force_install_dir"), command.index("+login"))
+            self.assertEqual(command[command.index("+workshop_download_item") + 1], CS2_APP_ID)
+            content_id = command[command.index("+workshop_download_item") + 2]
+            content_dir = (
+                Path(config["Defaults"]["WorkshopDownloadRoot"])
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / CS2_APP_ID
+                / content_id
+            )
+            content_dir.mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Success. Downloaded item {0}".format(content_id),
+            )
+
+        with mock.patch("subprocess.run", side_effect=fake_steamcmd):
+            self.run_quietly(
+                lambda: app.update_catalog_downloads(paths, True, config, db),
+                inputs=["a", "a"],
+            )
+
+        self.assertEqual(len(commands), len(CS2_WORKSHOP_ITEMS))
+        self.assertEqual(
+            {
+                command[command.index("+workshop_download_item") + 2]
+                for command in commands
+            },
+            {item["ContentId"] for item in CS2_WORKSHOP_ITEMS},
+        )
 
     def test_analysis_todo_outputs_all_game_type_branches(self):
         app = self.app()

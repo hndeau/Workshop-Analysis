@@ -70,6 +70,7 @@ Inside the interpreter, use commands:
 WorkshopAnalysis> help
 WorkshopAnalysis> bootstrap
 WorkshopAnalysis> download
+WorkshopAnalysis> update
 WorkshopAnalysis> catalog
 WorkshopAnalysis> status
 WorkshopAnalysis> exit
@@ -77,10 +78,17 @@ WorkshopAnalysis> exit
 
 Use `reconfigure` later to revisit bootstrap settings without deleting catalog data.
 
+`download` asks for the game first, then uses the selected game's analysis type to choose the Source 2 or Unreal Engine 5 workflow. New games still prompt for an analysis type when they are created.
+
+When adding games, enter the Steam AppID first. The tool attempts to resolve the game title from Steam app metadata and uses it as the title default. When adding workshop content, enter the Workshop ContentID first. The tool attempts to resolve the workshop title from Steam's published-file metadata and uses it as the title default. Manual title entry remains available when either lookup is unavailable or incorrect.
+
+Use `update` to re-download cataloged workshop content. It can update all workshop items, selected workshop items across the catalog, or selected items for one game.
+
 You can also run one command and exit, similar to tools like SBT:
 
 ```powershell
 .\WorkshopAnalysis download
+.\WorkshopAnalysis update
 .\WorkshopAnalysis catalog
 .\WorkshopAnalysis status
 ```
@@ -109,6 +117,7 @@ The catalog manager supports:
 
 - Add, edit, and remove games.
 - Add, edit, and remove workshop content associated with a game.
+- Re-download all or selected workshop content with the `update` command.
 - Purge downloaded workshop content when removing a workshop item.
 - Purge all associated workshop content when removing a game.
 

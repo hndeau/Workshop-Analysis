@@ -18,7 +18,13 @@ from .common import (
 )
 from .database import WorkshopDatabase
 from .prompts import prompt_choice, prompt_non_empty, prompt_yes_no
-from .tooling import download_file, get_github_latest_release_asset, install_zip_tool_from_github
+from .tooling import (
+    download_file,
+    get_github_latest_release_asset,
+    get_steam_app_title,
+    get_steam_workshop_item_title,
+    install_zip_tool_from_github,
+)
 
 __all__ = [
     "MIN_PYTHON",
@@ -32,6 +38,8 @@ __all__ = [
     "download_file",
     "ensure_directory",
     "get_github_latest_release_asset",
+    "get_steam_app_title",
+    "get_steam_workshop_item_title",
     "install_zip_tool_from_github",
     "main",
     "merge_defaults",
