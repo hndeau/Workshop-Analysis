@@ -1,1 +1,4 @@
 /state/
+/.venv/
+__pycache__/
+*.py[cod]
