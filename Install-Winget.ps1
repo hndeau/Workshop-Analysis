@@ -31,7 +31,8 @@ param(
     [string]$MicrosoftStoreSource = 'Auto',
     [switch]$Force,
     [switch]$KeepMicrosoftStoreSource,
-    [switch]$KeepDownloads
+    [switch]$KeepDownloads,
+    [int]$DownloadRetryCount = 3
 )
 
 Set-StrictMode -Version Latest
@@ -100,7 +101,8 @@ function Resolve-MicrosoftStoreSourceAction {
 function Invoke-Download {
     param(
         [Parameter(Mandatory)][string]$Uri,
-        [Parameter(Mandatory)][string]$OutFile
+        [Parameter(Mandatory)][string]$OutFile,
+        [int]$RetryCount = $DownloadRetryCount
     )
 
     $parent = Split-Path -Parent $OutFile
@@ -108,14 +110,38 @@ function Invoke-Download {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
 
-    Write-Host "    Downloading $Uri"
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        Write-Host "    Downloading $Uri"
+        if ($RetryCount -gt 1) {
+            Write-Host "    Attempt $attempt of $RetryCount"
+        }
 
-    try {
-        Start-BitsTransfer -Source $Uri -Destination $OutFile -ErrorAction Stop
-    }
-    catch {
-        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -Headers @{
-            'User-Agent' = 'winget-bootstrap'
+        if (Test-Path -LiteralPath $OutFile) {
+            Remove-Item -LiteralPath $OutFile -Force
+        }
+
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10 -Headers @{
+                'User-Agent' = 'winget-bootstrap'
+            }
+
+            if ((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 0)) {
+                return
+            }
+
+            throw "Download produced an empty file: $OutFile"
+        }
+        catch {
+            if (Test-Path -LiteralPath $OutFile) {
+                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            }
+
+            if ($attempt -ge $RetryCount) {
+                throw
+            }
+
+            Write-Warning "Download attempt $attempt failed. Retrying in $attempt second(s). $($_.Exception.Message)"
+            Start-Sleep -Seconds $attempt
         }
     }
 
@@ -278,7 +304,7 @@ function Initialize-WingetSources {
         'winget',
         '--accept-source-agreements',
         '--disable-interactivity'
-    ) | Out-Null
+    ) -AllowFailure | Out-Null
 }
 
 function Test-WingetCommunitySource {
@@ -286,7 +312,7 @@ function Test-WingetCommunitySource {
 
     Write-Step 'Testing winget community source'
 
-    Invoke-WingetCommand -WingetPath $WingetPath -ArgumentList @(
+    $exitCode = Invoke-WingetCommand -WingetPath $WingetPath -ArgumentList @(
         'search',
         '--id',
         'Google.Chrome',
@@ -295,7 +321,11 @@ function Test-WingetCommunitySource {
         'winget',
         '--accept-source-agreements',
         '--disable-interactivity'
-    ) | Out-Null
+    ) -AllowFailure
+
+    if ($exitCode -ne 0) {
+        Write-Warning "winget source smoke test failed with exit code $exitCode. Continuing because winget is installed and package installs may still work after source initialization settles."
+    }
 }
 
 function Download-WingetBundle {

@@ -26,5 +26,5 @@ if not errorlevel 1 (
     exit /b %ERRORLEVEL%
 )
 
-echo Python 3 was not found. Run setup.ps1 to install prerequisites.
+echo Python 3 was not found. Run setup.cmd to install prerequisites.
 exit /b 1

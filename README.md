@@ -26,13 +26,19 @@ Runtime Python package dependencies are listed in `requirements.txt`. The projec
 
 ## First-Time Setup
 
-Run setup once from PowerShell:
+Run setup once from Command Prompt or PowerShell:
 
-```powershell
-.\setup.ps1
+```cmd
+.\setup.cmd
 ```
 
-`setup.ps1` is only for initial dependency setup. It:
+`setup.cmd` is the Windows setup entrypoint. It invokes PowerShell with an execution-policy bypass for this script run:
+
+```cmd
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+`setup.ps1` remains the setup implementation and is only for initial dependency setup. It:
 
 1. Finds Python 3.9+ if already installed.
 2. Installs winget when needed by invoking `Install-Winget.ps1`.
@@ -42,8 +48,8 @@ Run setup once from PowerShell:
 
 To validate dependencies without launching bootstrap:
 
-```powershell
-.\setup.ps1 -SkipBootstrap
+```cmd
+.\setup.cmd -SkipBootstrap
 ```
 
 After setup, use `.\WorkshopAnalysis` directly for future runs. The first interpreter launch automatically walks through bootstrap if no configuration exists.

@@ -10,7 +10,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$SkipBootstrap
+    [switch]$SkipBootstrap,
+    [int]$WingetInstallRetryCount = 3
 )
 
 Set-StrictMode -Version 3.0
@@ -25,25 +26,64 @@ function Write-Section {
     Write-Host "== $Text ==" -ForegroundColor Cyan
 }
 
-function Get-CommandArguments {
-    param([Parameter(Mandatory)][string[]]$Command)
-
-    if ($Command.Count -le 1) {
-        return @()
-    }
-
-    return $Command[1..($Command.Count - 1)]
-}
-
 function Invoke-CandidatePython {
     param(
-        [Parameter(Mandatory)][string[]]$Command,
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$BaseArguments = @(),
         [Parameter(Mandatory)][string[]]$Arguments
     )
 
-    $exe = $Command[0]
-    $baseArgs = Get-CommandArguments -Command $Command
-    & $exe @baseArgs @Arguments
+    & $Exe @BaseArguments @Arguments
+}
+
+function Join-ProcessArguments {
+    param([string[]]$Arguments = @())
+
+    $escaped = foreach ($argument in $Arguments) {
+        if ($null -eq $argument) {
+            continue
+        }
+
+        $text = [string]$argument
+        if ($text -notmatch '[\s"]') {
+            $text
+            continue
+        }
+
+        '"' + ($text -replace '"', '\"') + '"'
+    }
+
+    return ($escaped -join ' ')
+}
+
+function Invoke-ProcessCapture {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Exe
+    $startInfo.Arguments = Join-ProcessArguments -Arguments $Arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Failed to start $Exe"
+    }
+
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Output = (($stdout + "`n" + $stderr).Trim())
+    }
 }
 
 function Test-CommandExists {
@@ -61,6 +101,104 @@ function Add-WindowsAppsToPath {
     if ((Test-Path -LiteralPath $windowsApps) -and ($env:Path -notlike "*$windowsApps*")) {
         $env:Path = "$env:Path;$windowsApps"
     }
+}
+
+function Refresh-ProcessPath {
+    $pathParts = New-Object System.Collections.Generic.List[string]
+
+    foreach ($scope in @('Machine', 'User')) {
+        $scopePath = [Environment]::GetEnvironmentVariable('Path', $scope)
+        if (-not [string]::IsNullOrWhiteSpace($scopePath)) {
+            foreach ($part in $scopePath -split ';') {
+                if (-not [string]::IsNullOrWhiteSpace($part)) {
+                    $pathParts.Add($part.Trim()) | Out-Null
+                }
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
+        foreach ($part in $env:Path -split ';') {
+            if (-not [string]::IsNullOrWhiteSpace($part)) {
+                $pathParts.Add($part.Trim()) | Out-Null
+            }
+        }
+    }
+
+    $knownRoots = @(
+        (Join-Path $env:LocalAppData 'Microsoft\WindowsApps'),
+        (Join-Path $env:LocalAppData 'Programs\Python'),
+        (Join-Path $env:ProgramFiles 'Python')
+    )
+
+    foreach ($root in $knownRoots) {
+        if (Test-Path -LiteralPath $root) {
+            $pathParts.Add($root) | Out-Null
+        }
+    }
+
+    $pythonRoots = @(
+        (Join-Path $env:LocalAppData 'Programs\Python'),
+        (Join-Path $env:ProgramFiles 'Python')
+    )
+
+    foreach ($root in $pythonRoots) {
+        if (-not (Test-Path -LiteralPath $root)) {
+            continue
+        }
+
+        Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $pathParts.Add($_.FullName) | Out-Null
+                $scripts = Join-Path $_.FullName 'Scripts'
+                if (Test-Path -LiteralPath $scripts) {
+                    $pathParts.Add($scripts) | Out-Null
+                }
+            }
+    }
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $resolvedParts = New-Object System.Collections.Generic.List[string]
+    foreach ($part in $pathParts) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            continue
+        }
+        if ($seen.Add($part)) {
+            $resolvedParts.Add($part) | Out-Null
+        }
+    }
+
+    $env:Path = $resolvedParts -join ';'
+}
+
+function New-PythonCandidate {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+
+    return [pscustomobject]@{
+        Exe = $Exe
+        Arguments = $Arguments
+    }
+}
+
+function Resolve-CandidateExecutable {
+    param([Parameter(Mandatory)][string]$Exe)
+
+    if ($Exe -match '[\\/]') {
+        if (Test-Path -LiteralPath $Exe) {
+            return $Exe
+        }
+        return $null
+    }
+
+    $command = Get-Command $Exe -ErrorAction SilentlyContinue
+    if ($command -and $command.Source) {
+        return $command.Source
+    }
+
+    return $null
 }
 
 function Get-WingetPath {
@@ -111,48 +249,80 @@ function Ensure-Winget {
 function Get-PythonCandidates {
     $candidates = New-Object System.Collections.Generic.List[object]
     $venvPython = Join-Path $ScriptRoot '.venv\Scripts\python.exe'
-    $candidates.Add(@($venvPython)) | Out-Null
-    $candidates.Add(@('py', '-3')) | Out-Null
-    $candidates.Add(@('python')) | Out-Null
-    $candidates.Add(@('python3')) | Out-Null
+    $candidates.Add((New-PythonCandidate -Exe $venvPython)) | Out-Null
+    $candidates.Add((New-PythonCandidate -Exe 'py' -Arguments @('-3'))) | Out-Null
+    $candidates.Add((New-PythonCandidate -Exe 'python')) | Out-Null
+    $candidates.Add((New-PythonCandidate -Exe 'python3')) | Out-Null
 
     $localPrograms = Join-Path $env:LocalAppData 'Programs\Python'
     if (Test-Path -LiteralPath $localPrograms) {
         Get-ChildItem -LiteralPath $localPrograms -Recurse -File -Filter python.exe -ErrorAction SilentlyContinue |
             Sort-Object FullName -Descending |
-            ForEach-Object { $candidates.Add(@($_.FullName)) | Out-Null }
+            ForEach-Object { $candidates.Add((New-PythonCandidate -Exe $_.FullName)) | Out-Null }
     }
 
     return $candidates
 }
 
 function Find-Python {
-    $versionScript = @'
-import sys
-print("{}.{}.{}".format(*sys.version_info[:3]))
-'@
+    function Test-PythonCandidate {
+        param(
+            [Parameter(Mandatory)][string]$Exe,
+            [string[]]$Arguments = @()
+        )
 
-    foreach ($candidate in Get-PythonCandidates) {
-        if (-not (Test-CommandExists -Command $candidate[0])) {
-            continue
+        $resolvedExe = Resolve-CandidateExecutable -Exe $Exe
+        if (-not $resolvedExe) {
+            return $null
         }
 
         try {
-            $output = Invoke-CandidatePython -Command $candidate -Arguments @('-c', $versionScript) 2>$null
-            if (-not $output) {
-                continue
+            $probeArguments = @($Arguments) + @('--version')
+            $probe = Invoke-ProcessCapture -Exe $resolvedExe -Arguments $probeArguments
+            if ($probe.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($probe.Output)) {
+                return $null
             }
 
-            $version = [version]($output | Select-Object -First 1)
-            if ($version -ge $MinimumPythonVersion) {
-                return [pscustomobject]@{
-                    Command = [string[]]$candidate
-                    Version = $version
-                }
+            if ($probe.Output -notmatch 'Python\s+([0-9]+(?:\.[0-9]+){1,2})') {
+                return $null
+            }
+
+            $version = [version]$Matches[1]
+            if ($version -lt $MinimumPythonVersion) {
+                return $null
+            }
+
+            return [pscustomobject]@{
+                Exe = $resolvedExe
+                Arguments = $Arguments
+                Version = $version
             }
         }
         catch {
-            continue
+            return $null
+        }
+    }
+
+    $venvPython = Join-Path $ScriptRoot '.venv\Scripts\python.exe'
+    foreach ($candidate in @(
+        @{ Exe = $venvPython; Arguments = @() },
+        @{ Exe = 'py'; Arguments = @('-3') },
+        @{ Exe = 'python'; Arguments = @() },
+        @{ Exe = 'python3'; Arguments = @() }
+    )) {
+        $result = Test-PythonCandidate -Exe $candidate.Exe -Arguments $candidate.Arguments
+        if ($result) {
+            return $result
+        }
+    }
+
+    $localPrograms = Join-Path $env:LocalAppData 'Programs\Python'
+    if (Test-Path -LiteralPath $localPrograms) {
+        foreach ($pythonExe in Get-ChildItem -LiteralPath $localPrograms -Recurse -File -Filter python.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending) {
+            $result = Test-PythonCandidate -Exe $pythonExe.FullName
+            if ($result) {
+                return $result
+            }
         }
     }
 
@@ -165,9 +335,34 @@ function Install-Python {
     $winget = Ensure-Winget
 
     Write-Host 'Python 3.9+ was not found. Installing Python 3.12 with winget...'
-    & $winget install --id Python.Python.3.12 --exact --source winget --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -ne 0) {
-        throw "winget failed to install Python. Exit code: $LASTEXITCODE"
+    for ($attempt = 1; $attempt -le $WingetInstallRetryCount; $attempt++) {
+        if ($WingetInstallRetryCount -gt 1) {
+            Write-Host "winget install attempt $attempt of $WingetInstallRetryCount."
+        }
+
+        & $winget install --id Python.Python.3.12 --exact --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity
+        $exitCode = $LASTEXITCODE
+        Refresh-ProcessPath
+        Add-WindowsAppsToPath
+
+        if ($exitCode -eq 0) {
+            return
+        }
+
+        $installedPython = Find-Python
+        if ($installedPython) {
+            Write-Host "Python $($installedPython.Version) is available after winget returned exit code $exitCode."
+            return
+        }
+
+        if ($attempt -lt $WingetInstallRetryCount) {
+            Write-Warning "winget failed to install Python. Exit code: $exitCode. Retrying in $attempt second(s)."
+            & $winget source update winget --accept-source-agreements --disable-interactivity 2>$null | Out-Null
+            Start-Sleep -Seconds $attempt
+            continue
+        }
+
+        throw "winget failed to install Python after $WingetInstallRetryCount attempt(s). Last exit code: $exitCode"
     }
 }
 
@@ -180,8 +375,16 @@ function Install-PythonRequirements {
         return
     }
 
+    $requirements = Get-Content -LiteralPath $requirementsPath |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_.TrimStart() -notlike '#*' }
+
+    if (-not $requirements) {
+        Write-Host 'requirements.txt has no active packages; skipping package install.'
+        return
+    }
+
     Write-Section -Text 'Python package setup'
-    Invoke-CandidatePython -Command $Python.Command -Arguments @('-m', 'pip', 'install', '--disable-pip-version-check', '-r', $requirementsPath)
+    Invoke-CandidatePython -Exe $Python.Exe -BaseArguments $Python.Arguments -Arguments @('-m', 'pip', 'install', '--disable-pip-version-check', '-r', $requirementsPath)
     if ($LASTEXITCODE -ne 0) {
         throw "pip failed to install requirements. Exit code: $LASTEXITCODE"
     }
@@ -191,6 +394,7 @@ Write-Section -Text 'WorkshopAnalysis setup'
 $python = Find-Python
 if (-not $python) {
     Install-Python
+    Refresh-ProcessPath
     $python = Find-Python
 }
 
