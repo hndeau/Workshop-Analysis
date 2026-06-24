@@ -1,5 +1,6 @@
 """Reusable WorkshopAnalysis application package."""
 
+from .analysis import WorkshopAnalyzer, parse_vpk_directory
 from .app import WorkshopAnalysis
 from .cli import build_parser, main
 from .common import (
@@ -31,6 +32,7 @@ __all__ = [
     "SCRIPT_ROOT",
     "SUPPORTED_GAME_TYPES",
     "USER_AGENT",
+    "WorkshopAnalyzer",
     "WorkshopAnalysis",
     "WorkshopDatabase",
     "as_path",
@@ -44,6 +46,7 @@ __all__ = [
     "main",
     "merge_defaults",
     "path_is_relative_to",
+    "parse_vpk_directory",
     "prompt_choice",
     "prompt_non_empty",
     "prompt_yes_no",

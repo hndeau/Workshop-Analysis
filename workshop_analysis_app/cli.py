@@ -26,6 +26,20 @@ def build_parser():
         help="Skip Source 2 / UE5 tool installation checks for download commands.",
     )
     parser.add_argument(
+        "--raw",
+        "-Raw",
+        dest="raw_mode",
+        action="store_true",
+        help="Use the line-oriented text interpreter instead of the in-place terminal UI.",
+    )
+    parser.add_argument(
+        "--debug",
+        "--verbose",
+        dest="debug",
+        action="store_true",
+        help="Show debug details, including raw SteamCMD output.",
+    )
+    parser.add_argument(
         "-Bootstrap",
         "--bootstrap",
         action="store_true",
@@ -66,10 +80,13 @@ def main(argv=None):
         return 1
 
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, command_options = parser.parse_known_args(argv)
+    if command_options:
+        args.commands.extend(command_options)
     app = WorkshopAnalysis(
         args.state_root,
         no_tool_bootstrap=args.no_tool_bootstrap or args.NoToolBootstrap,
+        debug=args.debug,
     )
     try:
         app.run(
@@ -77,6 +94,7 @@ def main(argv=None):
             bootstrap=args.bootstrap,
             reconfigure=args.reconfigure,
             manage_catalog=args.manage_catalog,
+            raw_mode=args.raw_mode,
         )
     except KeyboardInterrupt:
         print()
