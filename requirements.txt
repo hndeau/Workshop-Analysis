@@ -1,0 +1,2 @@
+# Workshop Analysis currently uses only the Python standard library.
+# Keep this file as the single place for future runtime Python dependencies.

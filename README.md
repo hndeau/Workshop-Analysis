@@ -22,6 +22,8 @@ Supported game/tooling profiles:
 
 If Python is missing, `setup.ps1` attempts to install it with `winget`. If `winget` is also missing, setup first runs `Install-Winget.ps1` to bootstrap winget/App Installer.
 
+Runtime Python package dependencies are listed in `requirements.txt`. The project currently uses only the Python standard library, so the file contains no active third-party packages.
+
 ## First-Time Setup
 
 Run setup once from PowerShell:
@@ -36,7 +38,7 @@ Run setup once from PowerShell:
 2. Installs winget when needed by invoking `Install-Winget.ps1`.
 3. Installs Python 3.12 through winget when Python is missing.
 4. Installs Python package requirements if `requirements.txt` exists.
-5. Runs `.\WorkshopAnalysis -Bootstrap`.
+5. Runs `.\WorkshopAnalysis`.
 
 To validate dependencies without launching bootstrap:
 
@@ -44,26 +46,37 @@ To validate dependencies without launching bootstrap:
 .\setup.ps1 -SkipBootstrap
 ```
 
-After setup, use `.\WorkshopAnalysis` directly for future runs.
+After setup, use `.\WorkshopAnalysis` directly for future runs. The first interpreter launch automatically walks through bootstrap if no configuration exists.
 
 ## Running
 
-Start the normal interactive download flow:
+Open the command interpreter:
 
 ```powershell
 .\WorkshopAnalysis
 ```
 
-Re-run bootstrap:
+If this is the first run and `state\config.json` does not exist, the interpreter starts initial setup before showing the command prompt.
 
-```powershell
-.\WorkshopAnalysis -Reconfigure
+Inside the interpreter, use commands:
+
+```text
+WorkshopAnalysis> help
+WorkshopAnalysis> bootstrap
+WorkshopAnalysis> download
+WorkshopAnalysis> catalog
+WorkshopAnalysis> status
+WorkshopAnalysis> exit
 ```
 
-Skip optional Source 2 / UE5 tool checks for one run:
+Use `reconfigure` later to revisit bootstrap settings without deleting catalog data.
+
+You can also run one command and exit, similar to tools like SBT:
 
 ```powershell
-.\WorkshopAnalysis -NoToolBootstrap
+.\WorkshopAnalysis download
+.\WorkshopAnalysis catalog
+.\WorkshopAnalysis status
 ```
 
 Use a custom state directory:
@@ -72,12 +85,18 @@ Use a custom state directory:
 .\WorkshopAnalysis -StateRoot C:\Path\To\State
 ```
 
-## Catalog Management
-
-Open the catalog manager:
+Skip optional Source 2 / UE5 tool checks for download commands:
 
 ```powershell
-.\WorkshopAnalysis -ManageCatalog
+.\WorkshopAnalysis --no-tool-bootstrap download
+```
+
+## Catalog Management
+
+Open the catalog manager from the interpreter:
+
+```text
+WorkshopAnalysis> catalog
 ```
 
 The catalog manager supports:
@@ -104,6 +123,16 @@ The `state/` directory is ignored by Git.
 
 Older `state/games.json` catalogs are migrated into SQLite automatically if `workshop_analysis.db` is empty.
 
+## Project Layout
+
+- `workshop_analysis.py`: compatibility entrypoint that preserves the existing import and launcher surface.
+- `workshop_analysis_app\cli.py`: command-line parsing and process entrypoint.
+- `workshop_analysis_app\app.py`: interactive workflows, command interpreter, downloads, and catalog orchestration.
+- `workshop_analysis_app\database.py`: SQLite schema, migration, and catalog persistence.
+- `workshop_analysis_app\tooling.py`: download helpers and external tool installation helpers.
+- `workshop_analysis_app\prompts.py`: reusable interactive prompt helpers.
+- `workshop_analysis_app\common.py`: shared constants, path helpers, and JSON config helpers.
+
 ## Tests
 
 Run the test suite:
@@ -114,11 +143,7 @@ python -m unittest discover -v
 
 The tests use only the Python standard library. They cover bootstrap behavior, SQLite catalog persistence, game/workshop add/edit/remove flows, download metadata, deletion safety, tool setup branches, and CLI error handling.
 
-Recent local coverage estimate using Python's standard-library `trace` module:
-
-```text
-workshop_analysis.py stdlib trace coverage: 902/965 lines (93.5%)
-```
+The implementation is split into reusable modules under `workshop_analysis_app`, while `workshop_analysis.py` remains the stable wrapper for existing launchers and imports.
 
 ## Repository Description
 

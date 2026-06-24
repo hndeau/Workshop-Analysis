@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,7 +152,7 @@ class BootstrapAndRunTests(WorkshopAnalysisTestCase):
             config["SteamCmd"]["ExePath"] = str(steamcmd)
 
         with mock.patch.object(app, "install_steamcmd", side_effect=fake_install_steamcmd):
-            self.run_quietly(lambda: app.run(bootstrap=True), inputs=["2", "n"])
+            self.run_quietly(lambda: app.run(commands=["bootstrap"]), inputs=["2", "n"])
 
         paths = app.state_paths()
         config = json.loads(paths["ConfigPath"].read_text(encoding="utf-8"))
@@ -191,7 +192,7 @@ class BootstrapAndRunTests(WorkshopAnalysisTestCase):
 
         with mock.patch("subprocess.run", side_effect=fake_steamcmd):
             self.run_quietly(
-                app.run,
+                lambda: app.run(commands=["download"]),
                 inputs=["", "n", "Test Game", "123", "n", "Test Item", "456"],
             )
 
@@ -430,14 +431,14 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         install_dir = self.temp_dir / "tool"
 
         def fake_download(uri, out_file):
-            with wa.zipfile.ZipFile(out_file, "w") as archive:
+            with zipfile.ZipFile(out_file, "w") as archive:
                 archive.writestr("nested/tool.exe", "exe")
 
         with mock.patch(
-            "workshop_analysis.get_github_latest_release_asset",
+            "workshop_analysis_app.tooling.get_github_latest_release_asset",
             return_value={"name": "tool.zip", "browser_download_url": "https://example.test/tool.zip"},
         ):
-            with mock.patch("workshop_analysis.download_file", side_effect=fake_download):
+            with mock.patch("workshop_analysis_app.tooling.download_file", side_effect=fake_download):
                 with redirect_stdout(io.StringIO()):
                     exe_path = wa.install_zip_tool_from_github(
                         "owner/repo",
@@ -451,14 +452,14 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
 
     def test_install_zip_tool_from_github_errors_when_executable_is_missing(self):
         def fake_download(uri, out_file):
-            with wa.zipfile.ZipFile(out_file, "w") as archive:
+            with zipfile.ZipFile(out_file, "w") as archive:
                 archive.writestr("readme.txt", "missing")
 
         with mock.patch(
-            "workshop_analysis.get_github_latest_release_asset",
+            "workshop_analysis_app.tooling.get_github_latest_release_asset",
             return_value={"name": "tool.zip", "browser_download_url": "https://example.test/tool.zip"},
         ):
-            with mock.patch("workshop_analysis.download_file", side_effect=fake_download):
+            with mock.patch("workshop_analysis_app.tooling.download_file", side_effect=fake_download):
                 with redirect_stdout(io.StringIO()):
                     with self.assertRaises(RuntimeError):
                         wa.install_zip_tool_from_github(
@@ -473,10 +474,10 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         config = self.config(app)
 
         def fake_download(uri, out_file):
-            with wa.zipfile.ZipFile(out_file, "w") as archive:
+            with zipfile.ZipFile(out_file, "w") as archive:
                 archive.writestr("steamcmd.exe", "exe")
 
-        with mock.patch("workshop_analysis.download_file", side_effect=fake_download):
+        with mock.patch("workshop_analysis_app.app.download_file", side_effect=fake_download):
             self.run_quietly(lambda: app.install_steamcmd(config), inputs=[""])
 
         self.assertTrue(Path(config["SteamCmd"]["ExePath"]).exists())
@@ -505,7 +506,7 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         cli_path = self.temp_dir / "source2" / "Source2Viewer-CLI.exe"
         cli_path.parent.mkdir(parents=True)
         cli_path.write_text("exe", encoding="utf-8")
-        with mock.patch("workshop_analysis.install_zip_tool_from_github", return_value=str(cli_path)):
+        with mock.patch("workshop_analysis_app.app.install_zip_tool_from_github", return_value=str(cli_path)):
             self.run_quietly(lambda: app.ensure_source2_tools(success_config), inputs=["y", str(cli_path.parent)])
         self.assertTrue(success_config["Tools"]["Source2"]["Installed"])
         self.assertEqual(success_config["Tools"]["Source2"]["CliPath"], str(cli_path))
@@ -514,7 +515,7 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         manual_path = self.temp_dir / "manual" / "Source2Viewer-CLI.exe"
         manual_path.parent.mkdir(parents=True)
         manual_path.write_text("exe", encoding="utf-8")
-        with mock.patch("workshop_analysis.install_zip_tool_from_github", side_effect=RuntimeError("no asset")):
+        with mock.patch("workshop_analysis_app.app.install_zip_tool_from_github", side_effect=RuntimeError("no asset")):
             self.run_quietly(
                 lambda: app.ensure_source2_tools(fallback_config),
                 inputs=["y", str(self.temp_dir / "auto-source2"), str(manual_path)],
@@ -534,7 +535,7 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         unrealpak.parent.mkdir(parents=True)
         unrealpak.write_text("exe", encoding="utf-8")
 
-        with mock.patch("workshop_analysis.install_zip_tool_from_github", side_effect=RuntimeError("no asset")):
+        with mock.patch("workshop_analysis_app.app.install_zip_tool_from_github", side_effect=RuntimeError("no asset")):
             self.run_quietly(
                 lambda: app.ensure_unreal5_tools(config),
                 inputs=[str(install_dir), "y", str(retoc), "n", str(engine_dir)],
@@ -609,16 +610,45 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
     def test_main_success_keyboard_interrupt_and_minimum_python_check(self):
         with mock.patch.object(wa.WorkshopAnalysis, "run", return_value=None) as run:
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(wa.main(["--state-root", str(self.temp_dir / "state"), "--manage-catalog"]), 0)
-        self.assertTrue(run.call_args.kwargs["manage_catalog"])
+                self.assertEqual(wa.main(["--state-root", str(self.temp_dir / "state"), "catalog"]), 0)
+        self.assertEqual(run.call_args.kwargs["commands"], ["catalog"])
 
         with mock.patch.object(wa.WorkshopAnalysis, "run", side_effect=KeyboardInterrupt):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(wa.main(["--state-root", str(self.temp_dir / "state")]), 130)
 
-        with mock.patch.object(wa.sys, "version_info", (3, 8, 0)):
+        with mock.patch.object(sys, "version_info", (3, 8, 0)):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(wa.main([]), 1)
+
+    def test_shell_help_and_exit(self):
+        app = self.app()
+        wa.save_json_file(app.state_paths()["ConfigPath"], self.config(app))
+        self.run_quietly(app.run_shell, inputs=["help", "exit"])
+
+    def test_shell_runs_initial_bootstrap_when_config_is_missing(self):
+        app = self.app()
+
+        def fake_install_steamcmd(config):
+            steamcmd = self.temp_dir / "steamcmd" / "steamcmd.exe"
+            steamcmd.parent.mkdir(parents=True)
+            steamcmd.write_text("", encoding="utf-8")
+            config["SteamCmd"]["Installed"] = True
+            config["SteamCmd"]["InstallDir"] = str(steamcmd.parent)
+            config["SteamCmd"]["ExePath"] = str(steamcmd)
+
+        with mock.patch.object(app, "install_steamcmd", side_effect=fake_install_steamcmd):
+            self.run_quietly(app.run_shell, inputs=["1", "y", "exit"])
+
+        config = json.loads(app.state_paths()["ConfigPath"].read_text(encoding="utf-8"))
+        self.assertEqual(config["Defaults"]["GameTypeId"], "source2")
+        self.assertTrue(config["Defaults"]["UseAnonymousSteam"])
+
+    def test_execute_unknown_command_and_status(self):
+        app = self.app()
+        self.run_quietly(lambda: app.execute_command(["status"]))
+        self.run_quietly(lambda: app.execute_command(["bogus"]))
+        self.assertFalse(app.execute_command(["exit"]))
 
 
 if __name__ == "__main__":

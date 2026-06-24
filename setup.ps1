@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     This script is only for initial setup. Future runs should invoke the program
-    directly with .\WorkshopAnalysis and any desired flags.
+    directly with .\WorkshopAnalysis and use commands inside the interpreter.
 #>
 
 [CmdletBinding()]
@@ -180,16 +180,8 @@ function Install-PythonRequirements {
         return
     }
 
-    $requirements = Get-Content -LiteralPath $requirementsPath |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_.TrimStart() -notlike '#*' }
-
-    if (-not $requirements) {
-        Write-Host 'requirements.txt has no active packages; skipping package install.'
-        return
-    }
-
     Write-Section -Text 'Python package setup'
-    Invoke-CandidatePython -Command $Python.Command -Arguments @('-m', 'pip', 'install', '-r', $requirementsPath)
+    Invoke-CandidatePython -Command $Python.Command -Arguments @('-m', 'pip', 'install', '--disable-pip-version-check', '-r', $requirementsPath)
     if ($LASTEXITCODE -ne 0) {
         throw "pip failed to install requirements. Exit code: $LASTEXITCODE"
     }
@@ -214,13 +206,13 @@ if ($SkipBootstrap) {
     return
 }
 
-Write-Section -Text 'Initial bootstrap'
+Write-Section -Text 'Launching WorkshopAnalysis'
 $launcher = Join-Path $ScriptRoot 'WorkshopAnalysis.cmd'
 if (-not (Test-Path -LiteralPath $launcher)) {
     throw "WorkshopAnalysis launcher was not found at $launcher"
 }
 
-& $launcher -Bootstrap
+& $launcher
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
