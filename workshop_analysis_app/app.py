@@ -11,6 +11,7 @@ import time
 import zipfile
 from pathlib import Path
 
+from .analysis import WorkshopAnalyzer, normalize_mode
 from .common import (
     SUPPORTED_GAME_TYPES,
     as_path,
@@ -615,15 +616,8 @@ class WorkshopAnalysis:
                 game,
                 item,
             )
-            self.invoke_analysis_todo(
-                config,
-                game["GameTypeId"],
-                game,
-                item,
-                download_path,
-            )
             self.print_file_inventory(download_path)
-            self.offer_analysis_actions(config, game, item, download_path)
+            self.offer_analysis_actions(paths, config, game, item, download_path)
             print()
             print("Done.")
         return item
@@ -670,7 +664,7 @@ class WorkshopAnalysis:
         print("Removed workshop content database entry.")
         return True
 
-    def manage_workshop_content(self, config, database, game, item):
+    def manage_workshop_content(self, paths, config, database, game, item):
         while True:
             item = database.get_workshop_content(item["Id"])
             if not item:
@@ -679,6 +673,8 @@ class WorkshopAnalysis:
 
             write_section("Manage workshop content")
             print(self.describe_workshop_content_status(config, game, item))
+            print("[A] Analyze automatic")
+            print("[M] Analyze manual")
             print("[E] Edit workshop content")
             print("[R] Remove workshop content")
             print("[B] Back")
@@ -686,6 +682,14 @@ class WorkshopAnalysis:
             answer = input("Select an action: ").strip().lower()
             if answer in ("b", "back", "q", "quit"):
                 return
+            if answer in ("a", "auto", "automatic", "m", "manual", "all"):
+                content_path = as_path(item.get("LastDownloadPath"))
+                if not content_path or not content_path.exists():
+                    print("This workshop item has not been downloaded yet.")
+                    continue
+                mode = "manual" if answer in ("m", "manual", "all") else "auto"
+                self.run_game_analysis(paths, config, game, item, content_path, mode)
+                continue
             if answer in ("e", "edit"):
                 item = self.edit_workshop_content(database, item)
                 continue
@@ -744,7 +748,7 @@ class WorkshopAnalysis:
             except ValueError:
                 index = 0
             if 1 <= index <= len(items):
-                self.manage_workshop_content(config, database, game, items[index - 1])
+                self.manage_workshop_content(paths, config, database, game, items[index - 1])
                 continue
             print("WARNING: Invalid selection.")
 
@@ -1195,6 +1199,136 @@ class WorkshopAnalysis:
         else:
             print("No VPK/pak/utoc/ucas package files were detected.")
 
+    @staticmethod
+    def prompt_analysis_mode(default="auto"):
+        write_section("Analysis mode")
+        print("[A] Automatic - list code, scripts, config, packages, and other programmatic files.")
+        print("[M] Manual - list every detected file, still ordered by security severity.")
+        while True:
+            answer = input("Select analysis mode [A]: ").strip().lower()
+            if not answer:
+                answer = default
+            try:
+                return normalize_mode(answer)
+            except ValueError:
+                print("WARNING: Select automatic or manual analysis.")
+
+    @staticmethod
+    def print_analysis_result(result, limit=120):
+        findings = result.get("Findings", [])
+        events = result.get("Events", [])
+        mode_label = "Automatic" if result.get("Mode") == "auto" else "Manual"
+        write_section("{0} analysis results".format(mode_label))
+        print("Full report: {0}".format(result.get("ReportPath") or Path(result.get("OutputRoot", "")) / "analysis.json"))
+        print("Presented files: {0}".format(len(findings)))
+        print("Presented events: {0}".format(len(events)))
+
+        if events:
+            print()
+            print("Events:")
+            for index, event in enumerate(events[:limit], start=1):
+                location = event.get("Path") or event.get("Container") or event.get("Source")
+                print(
+                    "[{0:03}] {1:<8} {2:<24} {3} ({4})".format(
+                        index,
+                        event.get("Level"),
+                        event.get("Type"),
+                        location,
+                        event.get("Message"),
+                    )
+                )
+
+        if findings:
+            print()
+            print("Files:")
+        else:
+            print("No files matched this analysis mode.")
+
+        for index, finding in enumerate(findings[:limit], start=1):
+            container = finding.get("Container")
+            location = finding.get("Path")
+            if container:
+                location = "{0}!{1}".format(container, location)
+            print(
+                "[{0:03}] {1:<8} {2:<10} {3} ({4})".format(
+                    index,
+                    finding.get("SeverityLabel"),
+                    finding.get("Source"),
+                    location,
+                    finding.get("Reason"),
+                )
+            )
+
+        remaining = len(findings) - limit
+        if remaining > 0:
+            print("... {0} more finding(s) written to analysis.json".format(remaining))
+
+    def run_game_analysis(self, paths, config, game, workshop_item, content_path, mode):
+        mode = normalize_mode(mode)
+        if not content_path or not Path(content_path).exists():
+            raise RuntimeError("Downloaded content was not found for analysis.")
+
+        analyzer = WorkshopAnalyzer(paths["ConfigPath"].parent)
+        result = analyzer.analyze(game, workshop_item, content_path, mode)
+        self.print_analysis_result(result)
+        return result
+
+    def select_existing_workshop_content(self, config, database, game, title=None):
+        write_section(title or "Select workshop content")
+        items = database.list_workshop_content(game["Id"])
+        if not items:
+            print("No workshop content is associated with this game.")
+            return None
+
+        for index, item in enumerate(items, start=1):
+            print(
+                "[{0}] {1}".format(
+                    index,
+                    self.describe_workshop_content_status(config, game, item),
+                )
+            )
+        print("[B] Back")
+
+        while True:
+            answer = input("Select workshop content: ").strip().lower()
+            if not answer and len(items) == 1:
+                return items[0]
+            if answer in ("b", "back", "q", "quit"):
+                return None
+            try:
+                index = int(answer)
+            except ValueError:
+                index = 0
+            if 1 <= index <= len(items):
+                return items[index - 1]
+            print("WARNING: Invalid selection.")
+
+    def analyze_workshop_content(self, paths, has_config, config, database, mode=None):
+        if not has_config:
+            print("No configuration was found. Running bootstrap first.")
+            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+            return
+
+        game = self.select_existing_game(database, "Analyze game")
+        if not game:
+            return
+        workshop_item = self.select_existing_workshop_content(
+            config,
+            database,
+            game,
+            "Analyze workshop content",
+        )
+        if not workshop_item:
+            return
+
+        content_path = as_path(workshop_item.get("LastDownloadPath"))
+        if not content_path or not content_path.exists():
+            print("This workshop item has not been downloaded yet.")
+            return
+
+        mode = normalize_mode(mode) if mode else self.prompt_analysis_mode("auto")
+        self.run_game_analysis(paths, config, game, workshop_item, content_path, mode)
+
     def run_extract_action(self, config, game, content_path):
         write_section("Extract")
         game_type_id = game.get("GameTypeId")
@@ -1231,30 +1365,26 @@ class WorkshopAnalysis:
             return
         print("Open this folder manually: {0}".format(content_path))
 
-    def offer_analysis_actions(self, config, game, workshop_item, content_path):
+    def offer_analysis_actions(self, paths, config, game, workshop_item, content_path):
         while True:
             write_section("Analysis actions")
-            self.print_menu_item("E", "Extract", "show extraction tooling for this game type", "green")
-            self.print_menu_item("L", "List", "print downloaded files", "cyan")
-            self.print_menu_item("D", "Decompile/convert", "show conversion/decompile workflow", "magenta")
-            self.print_menu_item("R", "Scan", "flag scripts, executables, packages, and metadata", "yellow")
+            self.print_menu_item("A", "Analyze automatic", "list likely code/script/programmatic files", "green")
+            self.print_menu_item("M", "Analyze manual", "list every detected file by severity", "yellow")
+            self.print_menu_item("L", "List downloaded files", "print raw downloaded file tree", "cyan")
             self.print_menu_item("O", "Open folder", "open downloaded content in Explorer", "blue")
             self.print_menu_item("B", "Back", "return to the previous menu", "white")
 
             answer = input("Select an action [B]: ").strip().lower()
             if answer in ("", "b", "back", "q", "quit"):
                 return
-            if answer in ("e", "extract"):
-                self.run_extract_action(config, game, content_path)
+            if answer in ("a", "auto", "automatic"):
+                self.run_game_analysis(paths, config, game, workshop_item, content_path, "auto")
+                continue
+            if answer in ("m", "manual", "all"):
+                self.run_game_analysis(paths, config, game, workshop_item, content_path, "manual")
                 continue
             if answer in ("l", "list"):
                 self.print_content_listing(content_path)
-                continue
-            if answer in ("d", "decompile", "convert"):
-                self.run_decompile_action(config, game, workshop_item, content_path)
-                continue
-            if answer in ("r", "scan"):
-                self.run_content_scan(content_path)
                 continue
             if answer in ("o", "open"):
                 self.open_folder(content_path)
@@ -1509,16 +1639,8 @@ class WorkshopAnalysis:
             workshop_item,
         )
 
-        self.invoke_analysis_todo(
-            config,
-            game["GameTypeId"],
-            game,
-            workshop_item,
-            download_path,
-        )
-
         self.print_file_inventory(download_path)
-        self.offer_analysis_actions(config, game, workshop_item, download_path)
+        self.offer_analysis_actions(paths, config, game, workshop_item, download_path)
 
         print()
         print("Done.")
@@ -1642,6 +1764,7 @@ class WorkshopAnalysis:
         print("  bootstrap      Run first-time setup prompts and write configuration.")
         print("  reconfigure    Re-run bootstrap prompts and update configuration.")
         print("  download       Select a game/workshop item, download it, and show analysis next steps.")
+        print("  analyze        Analyze downloaded workshop content in automatic or manual mode.")
         print("  update         Re-download cataloged workshop content.")
         print("  catalog        Manage games and associated workshop content.")
         print("  status         Show state paths and catalog counts.")
@@ -1789,6 +1912,7 @@ class WorkshopAnalysis:
         print()
         print(self.color_text("Primary Actions", "bold"))
         self.print_menu_item("D", "Download", "choose game/workshop content and install it", "green")
+        self.print_menu_item("A", "Analyze", "run automatic/manual analysis on downloaded content", "magenta")
         self.print_menu_item("U", "Update", "refresh all or selected catalog downloads", "yellow")
         self.print_menu_item("C", "Catalog", "add, edit, remove, or install content", "cyan")
         print()
@@ -1828,15 +1952,17 @@ class WorkshopAnalysis:
             return ["exit"]
         if lowered in ("d", "1"):
             return ["download"]
-        if lowered in ("u", "2"):
+        if lowered in ("a", "2"):
+            return ["analyze"]
+        if lowered in ("u", "3"):
             return ["update"]
-        if lowered in ("c", "3"):
+        if lowered in ("c", "4"):
             return ["catalog"]
-        if lowered in ("s", "4"):
+        if lowered in ("s", "5"):
             return ["status"]
-        if lowered in ("b", "5"):
+        if lowered in ("b", "6"):
             return ["reconfigure" if has_config else "bootstrap"]
-        if lowered in ("h", "?", "6"):
+        if lowered in ("h", "?", "7"):
             return ["help"]
         if lowered in (":", ";"):
             command = input("Command: ").strip()
@@ -1875,6 +2001,11 @@ class WorkshopAnalysis:
                 )
             else:
                 self.download_workshop_content(paths, has_config, config, database)
+            return True
+
+        if command in ("analyze", "analyse"):
+            mode = tokens[1] if len(tokens) > 1 else None
+            self.analyze_workshop_content(paths, has_config, config, database, mode)
             return True
 
         if command in ("update", "refresh"):

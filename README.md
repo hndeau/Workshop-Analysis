@@ -6,7 +6,7 @@ The tool keeps reusable game and workshop metadata in a local SQLite catalog, st
 
 ## Status
 
-This project is early-stage. It currently handles setup, catalog management, Steam Workshop downloads, and analysis workflow scaffolding. The actual deep content analysis steps are still placeholders.
+This project is early-stage. It currently handles setup, catalog management, Steam Workshop downloads, Source 2 file listing analysis, and analysis workflow scaffolding for deeper tooling.
 
 Supported game/tooling profiles:
 
@@ -71,6 +71,7 @@ WorkshopAnalysis> help
 WorkshopAnalysis> bootstrap
 WorkshopAnalysis> download
 WorkshopAnalysis> download 730 3735111145 --type source2 --anonymous
+WorkshopAnalysis> analyze
 WorkshopAnalysis> update
 WorkshopAnalysis> catalog
 WorkshopAnalysis> status
@@ -100,21 +101,28 @@ Use `update` to re-download cataloged workshop content. It can update all worksh
 After a download, Workshop Analysis prints a file inventory with file count, total size, extension counts, detected VPK/pak/utoc/ucas package files, interesting metadata such as `publish_data.txt`, and executable/script-like files worth reviewing. The guided flow then offers inline actions:
 
 ```text
-[E] Extract
-[L] List contents
-[D] Decompile/convert
-[R] Run scan
+[A] Analyze automatic
+[M] Analyze manual
+[L] List downloaded files
 [O] Open folder
 [B] Back
 ```
 
-The extract and decompile/convert actions currently keep the configured tool paths and next steps inside the tool while deeper Source 2 / UE5 automation is still being built.
+Analysis is routed automatically by the selected game's type. The user chooses only the mode:
+
+- Automatic: lists likely code, scripts, config, package contents, and other programmatic files while excluding low-signal assets such as textures/audio/models.
+- Manual: lists every detected file, still ordered by potential security severity.
+
+Each analysis writes a full raw report to `state\analysis\<AppID>\<ContentID>\analysis.json`. That report includes every observed file, generated file, event, warning, and error from the analysis pass, including corrupt or partially corrupt archives that may indicate decompression risk. Automatic and manual modes only control the curated presentation shown to the user; they do not reduce what is written to `analysis.json`.
+
+Source 2 analysis currently scans downloaded files, safely expands ZIP archives, parses VPK directory files to list contained package entries, records archive/VPK parsing errors as events, and marks the downloaded content as analyzed. Unreal Engine 5 analysis currently writes the same report shape with a stub event so the UE5 implementation can use the same content -> analysis -> full report -> curated presentation flow later.
 
 You can also run one command and exit, similar to tools like SBT:
 
 ```powershell
 .\WorkshopAnalysis download
 .\WorkshopAnalysis download 730 3735111145 --type source2 --anonymous
+.\WorkshopAnalysis analyze
 .\WorkshopAnalysis update
 .\WorkshopAnalysis catalog
 .\WorkshopAnalysis status
@@ -176,6 +184,7 @@ Older `state/games.json` catalogs are migrated into SQLite automatically if `wor
 - `workshop_analysis.py`: compatibility entrypoint that preserves the existing import and launcher surface.
 - `workshop_analysis_app\cli.py`: command-line parsing and process entrypoint.
 - `workshop_analysis_app\app.py`: interactive workflows, command interpreter, downloads, and catalog orchestration.
+- `workshop_analysis_app\analysis.py`: game-type analysis, Source 2 VPK listing, archive expansion, and severity ordering.
 - `workshop_analysis_app\database.py`: SQLite schema, migration, and catalog persistence.
 - `workshop_analysis_app\tooling.py`: download helpers and external tool installation helpers.
 - `workshop_analysis_app\prompts.py`: reusable interactive prompt helpers.
@@ -189,7 +198,7 @@ Run the test suite:
 python -m unittest discover -v
 ```
 
-The tests use only the Python standard library. They cover bootstrap behavior, SQLite catalog persistence, game/workshop add/edit/remove flows, download metadata, deletion safety, tool setup branches, and CLI error handling.
+The tests use only the Python standard library. They cover bootstrap behavior, SQLite catalog persistence, game/workshop add/edit/remove flows, download metadata, Source 2 analysis, deletion safety, tool setup branches, and CLI error handling.
 
 The implementation is split into reusable modules under `workshop_analysis_app`, while `workshop_analysis.py` remains the stable wrapper for existing launchers and imports.
 

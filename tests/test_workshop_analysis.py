@@ -1,6 +1,7 @@
 import io
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,31 @@ CS2_WORKSHOP_ITEMS = [
         "Url": "https://steamcommunity.com/sharedfiles/filedetails/?id=3691046714",
     },
 ]
+
+
+def make_vpk_directory(entries):
+    tree = bytearray()
+    by_extension = {}
+    for path, size in entries:
+        parts = Path(path)
+        extension = parts.suffix[1:] or " "
+        directory = str(parts.parent).replace("\\", "/")
+        if directory == ".":
+            directory = " "
+        filename = parts.stem if parts.suffix else parts.name
+        by_extension.setdefault(extension, {}).setdefault(directory, []).append((filename, size))
+
+    for extension, directories in by_extension.items():
+        tree.extend(extension.encode("utf-8") + b"\0")
+        for directory, files in directories.items():
+            tree.extend(directory.encode("utf-8") + b"\0")
+            for filename, size in files:
+                tree.extend(filename.encode("utf-8") + b"\0")
+                tree.extend(struct.pack("<IHHIIH", 0, 0, 0x7FFF, 0, size, 0xFFFF))
+            tree.extend(b"\0")
+        tree.extend(b"\0")
+    tree.extend(b"\0")
+    return struct.pack("<III", 0x55AA1234, 1, len(tree)) + bytes(tree)
 
 
 class WorkshopAnalysisTestCase(unittest.TestCase):
@@ -798,6 +824,102 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         self.assertIn("pak01_dir.vpk", inventory["ArchiveFiles"])
         self.assertIn("publish_data.txt", inventory["InterestingMetadata"])
         self.assertIn(str(Path("sub") / "installer.exe"), inventory["SuspiciousFiles"])
+
+    def test_source2_analysis_auto_and_manual_outputs_severity_ordered_files(self):
+        app = self.app()
+        analyzer = wa.WorkshopAnalyzer(app.state_paths()["ConfigPath"].parent)
+        content_dir = self.temp_dir / "source2-content"
+        (content_dir / "scripts").mkdir(parents=True)
+        (content_dir / "materials").mkdir(parents=True)
+        (content_dir / "scripts" / "entry.vjs").write_text("alert('x')", encoding="utf-8")
+        (content_dir / "materials" / "skin.vtex").write_text("texture", encoding="utf-8")
+        (content_dir / "publish_data.txt").write_text("metadata", encoding="utf-8")
+        (content_dir / "corrupt.zip").write_bytes(b"not a zip")
+        (content_dir / "broken_dir.vpk").write_bytes(b"bad vpk")
+        (content_dir / "pak01_dir.vpk").write_bytes(
+            make_vpk_directory(
+                [
+                    ("panorama/scripts/menu.vjs", 12),
+                    ("panorama/layout/main.vxml", 5),
+                    ("materials/ignored.vtex", 7),
+                    ("bin/plugin.dll", 10),
+                ]
+            )
+        )
+        with zipfile.ZipFile(content_dir / "nested.zip", "w") as archive:
+            archive.writestr("cfg/server.cfg", "sv_cheats 0")
+            archive.writestr("images/preview.png", "png")
+
+        game = {"Title": "CS2", "AppId": "730", "GameTypeId": "source2"}
+        item = {"Title": "Item", "ContentId": "200"}
+
+        auto_result = analyzer.analyze(game, item, content_dir, "auto")
+        auto_paths = [finding["Path"] for finding in auto_result["Findings"]]
+        auto_severities = [finding["Severity"] for finding in auto_result["Findings"]]
+        full_report = json.loads(Path(auto_result["ReportPath"]).read_text(encoding="utf-8"))
+        full_paths = [observation["Path"] for observation in full_report["Observations"]]
+        full_event_types = [event["Type"] for event in full_report["Events"]]
+
+        self.assertEqual(auto_severities, sorted(auto_severities, reverse=True))
+        self.assertIn("bin/plugin.dll", auto_paths)
+        self.assertIn("scripts/entry.vjs", auto_paths)
+        self.assertIn("cfg/server.cfg", auto_paths)
+        self.assertNotIn("materials/skin.vtex", auto_paths)
+        self.assertNotIn("materials/ignored.vtex", auto_paths)
+        self.assertIn("materials/skin.vtex", full_paths)
+        self.assertIn("materials/ignored.vtex", full_paths)
+        self.assertIn("archive_corrupt", full_event_types)
+        self.assertIn("vpk_parse_error", full_event_types)
+        self.assertIn("archive_corrupt", [event["Type"] for event in auto_result["Events"]])
+        self.assertTrue((content_dir / ".workshop_analysis" / "analysis_complete.json").exists())
+        self.assertTrue(Path(auto_result["ReportPath"]).exists())
+
+        manual_result = analyzer.analyze(game, item, content_dir, "manual")
+        manual_paths = [finding["Path"] for finding in manual_result["Findings"]]
+
+        self.assertIn("materials/skin.vtex", manual_paths)
+        self.assertIn("materials/ignored.vtex", manual_paths)
+        self.assertIn("images/preview.png", manual_paths)
+        self.assertIn("archive_corrupt", [event["Type"] for event in manual_result["Events"]])
+
+    def test_unreal5_analysis_returns_stub_report_shape(self):
+        app = self.app()
+        analyzer = wa.WorkshopAnalyzer(app.state_paths()["ConfigPath"].parent)
+        content_dir = self.temp_dir / "ue5-content"
+        content_dir.mkdir()
+        game = {"Title": "UE Game", "AppId": "500", "GameTypeId": "unreal5"}
+        item = {"Title": "Item", "ContentId": "600"}
+
+        result = analyzer.analyze(game, item, content_dir, "auto")
+        full_report = json.loads(Path(result["ReportPath"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(result["GameTypeId"], "unreal5")
+        self.assertEqual(full_report["GameTypeId"], "unreal5")
+        self.assertEqual(full_report["Observations"], [])
+        self.assertEqual(full_report["Events"][0]["Type"], "analysis_stub")
+
+    def test_analyze_command_uses_game_type_and_prompts_only_for_mode(self):
+        app = self.app()
+        paths = app.state_paths()
+        config = self.config(app)
+        wa.save_json_file(paths["ConfigPath"], config)
+        db = self.database()
+        game = db.create_game("Game", "100", "source2")
+        item = db.create_workshop_content(game["Id"], "Item", "200")
+        content_dir = self.temp_dir / "downloaded"
+        content_dir.mkdir()
+        (content_dir / "scripts.vjs").write_text("script", encoding="utf-8")
+        db.update_workshop_download(item["Id"], "2026-06-24T00:00:00Z", content_dir)
+
+        self.run_quietly(
+            lambda: app.execute_command(["analyze"]),
+            inputs=["", "", ""],
+        )
+
+        marker = content_dir / ".workshop_analysis" / "analysis_complete.json"
+        self.assertTrue(marker.exists())
+        marker_data = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(marker_data["Mode"], "auto")
 
     def test_catalog_status_badges_include_download_tool_and_analysis_state(self):
         app = self.app()
