@@ -658,6 +658,28 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         self.assertTrue(Path(exe_path).exists())
         self.assertFalse((install_dir / "tool.zip").exists())
 
+    def test_install_zip_tool_from_github_accepts_direct_executable_asset(self):
+        install_dir = self.temp_dir / "direct-tool"
+
+        def fake_download(uri, out_file):
+            Path(out_file).write_text("exe", encoding="utf-8")
+
+        with mock.patch(
+            "workshop_analysis_app.tooling.get_github_latest_release_asset",
+            return_value={"name": "tool.exe", "browser_download_url": "https://example.test/tool.exe"},
+        ):
+            with mock.patch("workshop_analysis_app.tooling.download_file", side_effect=fake_download):
+                with redirect_stdout(io.StringIO()):
+                    exe_path = wa.install_zip_tool_from_github(
+                        "owner/repo",
+                        r"tool\.exe",
+                        install_dir,
+                        "tool.exe",
+                    )
+
+        self.assertEqual(Path(exe_path), install_dir / "tool.exe")
+        self.assertEqual(Path(exe_path).read_text(encoding="utf-8"), "exe")
+
     def test_install_zip_tool_from_github_errors_when_executable_is_missing(self):
         def fake_download(uri, out_file):
             with zipfile.ZipFile(out_file, "w") as archive:
@@ -1157,9 +1179,19 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
             fmodel_path.write_text("fmodel", encoding="utf-8")
             return str(fmodel_path)
 
+        def fake_kismet(unreal5, install_dir, automatic=False):
+            kismet_path.parent.mkdir(parents=True, exist_ok=True)
+            kismet_path.write_text("kismet", encoding="utf-8")
+            unreal5["KismetAnalyzerPath"] = str(kismet_path)
+            return kismet_path
+
         with mock.patch(
             "workshop_analysis_app.app.install_zip_tool_from_github",
             side_effect=fake_install,
+        ), mock.patch.object(
+            app,
+            "install_kismet_analyzer",
+            side_effect=fake_kismet,
         ), mock.patch(
             "subprocess.run",
             return_value=SimpleNamespace(returncode=0, stdout="usage"),
@@ -1175,6 +1207,48 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         self.assertEqual(config["Tools"]["Unreal5"]["KismetAnalyzerPath"], str(kismet_path))
         self.assertEqual(config["Tools"]["Unreal5"]["UnrealPakPath"], str(unrealpak_path))
         self.assertTrue(config["Tools"]["Unreal5"]["Installed"])
+
+    def test_unreal5_analysis_bootstrap_continues_without_unrealpak(self):
+        app = self.app()
+        paths = app.state_paths()
+        config = self.config(app)
+        db = self.database()
+        game = db.create_game("UE Game", "500", "unreal5")
+        item = db.create_workshop_content(game["Id"], "Item", "600")
+        content_dir = self.temp_dir / "ue5-no-unrealpak"
+        content_dir.mkdir()
+        (content_dir / "DefaultGame.ini").write_text("[Game]", encoding="utf-8")
+        db.update_workshop_download(item["Id"], "2026-06-24T00:00:00Z", content_dir)
+
+        retoc_path = self.temp_dir / "retoc" / "retoc.exe"
+        fmodel_path = self.temp_dir / "fmodel" / "FModel.exe"
+        uasset_path = self.temp_dir / "uassetgui" / "UAssetGUI.exe"
+
+        def fake_install(repository, pattern, install_dir, executable_name):
+            target = {
+                "retoc.exe": retoc_path,
+                "FModel.exe": fmodel_path,
+                "UAssetGUI.exe": uasset_path,
+            }[executable_name]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(executable_name, encoding="utf-8")
+            return str(target)
+
+        with mock.patch(
+            "workshop_analysis_app.app.install_zip_tool_from_github",
+            side_effect=fake_install,
+        ), mock.patch.object(app, "install_kismet_analyzer", return_value=None), mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="usage"),
+        ):
+            result = self.run_quietly(
+                lambda: app.run_game_analysis(paths, config, game, db.get_workshop_content(item["Id"]), content_dir, "auto")
+            )
+
+        self.assertTrue(Path(result["ReportPath"]).exists())
+        self.assertEqual(config["Tools"]["Unreal5"]["RetocPath"], str(retoc_path))
+        self.assertIsNone(config["Tools"]["Unreal5"]["UnrealPakPath"])
+        self.assertFalse(config["Tools"]["Unreal5"]["Installed"])
 
     def test_analyze_command_uses_game_type_and_prompts_only_for_mode(self):
         app = self.app()

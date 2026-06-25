@@ -88,18 +88,30 @@ def get_github_latest_release_asset(repository, asset_name_regex):
 def install_zip_tool_from_github(repository, asset_name_regex, install_dir, expected_exe_name):
     install_dir = ensure_directory(install_dir)
     asset = get_github_latest_release_asset(repository, asset_name_regex)
-    zip_path = install_dir / asset["name"]
+    asset_path = install_dir / asset["name"]
+    expected_name = expected_exe_name.lower()
 
     print("Downloading {0} from {1}...".format(asset["name"], repository))
-    download_file(asset["browser_download_url"], zip_path)
+    download_file(asset["browser_download_url"], asset_path)
+
+    if asset_path.name.lower() == expected_name:
+        return str(asset_path)
+
+    if asset_path.suffix.lower() != ".zip":
+        raise RuntimeError(
+            "Downloaded {0}, but it is not a zip archive and does not match expected executable {1}.".format(
+                asset["name"],
+                expected_exe_name,
+            )
+        )
+
     try:
-        with zipfile.ZipFile(zip_path) as archive:
+        with zipfile.ZipFile(asset_path) as archive:
             archive.extractall(install_dir)
     finally:
-        if zip_path.exists():
-            zip_path.unlink()
+        if asset_path.exists():
+            asset_path.unlink()
 
-    expected_name = expected_exe_name.lower()
     for path in install_dir.rglob("*"):
         if path.is_file() and path.name.lower() == expected_name:
             return str(path)

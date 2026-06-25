@@ -128,6 +128,7 @@ class WorkshopAnalysis:
                     "OodlePath": None,
                     "EngineVersion": "auto",
                     "Validation": {},
+                    "SetupWarnings": [],
                 },
             },
         }
@@ -624,6 +625,104 @@ class WorkshopAnalysis:
                     return Path(manual_path)
         return None
 
+    def install_kismet_analyzer(self, unreal5, install_dir, automatic=False):
+        existing = as_path(unreal5.get("KismetAnalyzerPath"))
+        if existing and existing.exists():
+            return existing
+
+        publish_dir = ensure_directory(Path(install_dir) / "kismet-analyzer" / "publish")
+        source_dir = Path(install_dir) / "kismet-analyzer" / "source"
+        git_exe = shutil.which("git")
+        dotnet_exe = shutil.which("dotnet")
+        if not git_exe or not dotnet_exe:
+            missing = []
+            if not git_exe:
+                missing.append("git")
+            if not dotnet_exe:
+                missing.append("dotnet SDK")
+            message = (
+                "kismet-analyzer is source-distributed and could not be built because {0} "
+                "is not available on PATH.".format(", ".join(missing))
+            )
+            print("WARNING: {0}".format(message))
+            unreal5.setdefault("SetupWarnings", []).append(
+                {
+                    "Tool": "kismet-analyzer",
+                    "Repository": "trumank/kismet-analyzer",
+                    "Error": message,
+                    "CheckedUtc": utc_now_iso(),
+                }
+            )
+            return None
+
+        try:
+            if not source_dir.exists():
+                print("Cloning kismet-analyzer source...")
+                subprocess.run(
+                    [
+                        git_exe,
+                        "clone",
+                        "--depth",
+                        "1",
+                        "--recurse-submodules",
+                        "https://github.com/trumank/kismet-analyzer.git",
+                        str(source_dir),
+                    ],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=180,
+                )
+            print("Building kismet-analyzer...")
+            subprocess.run(
+                [
+                    dotnet_exe,
+                    "publish",
+                    str(source_dir / "kismet-analyzer.csproj"),
+                    "-c",
+                    "Release",
+                    "-r",
+                    "win-x64",
+                    "--self-contained",
+                    "true",
+                    "-o",
+                    str(publish_dir),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+            )
+            exe_path = publish_dir / "kismet-analyzer.exe"
+            if exe_path.exists():
+                unreal5["KismetAnalyzerPath"] = str(exe_path)
+                return exe_path
+            raise RuntimeError("Build completed, but kismet-analyzer.exe was not found.")
+        except Exception as exc:
+            print("WARNING: kismet-analyzer source build failed: {0}".format(exc))
+            unreal5.setdefault("SetupWarnings", []).append(
+                {
+                    "Tool": "kismet-analyzer",
+                    "Repository": "trumank/kismet-analyzer",
+                    "Error": str(exc),
+                    "CheckedUtc": utc_now_iso(),
+                }
+            )
+            if not automatic:
+                manual_path = self.prompt_optional_existing_path(
+                    "Optional path to existing kismet-analyzer.exe"
+                )
+                if manual_path:
+                    unreal5["KismetAnalyzerPath"] = manual_path
+                    return Path(manual_path)
+        return None
+
     @staticmethod
     def tool_output_preview(output, limit=600):
         text = (output or "").strip().replace("\r\n", "\n")
@@ -763,7 +862,7 @@ class WorkshopAnalysis:
                 unreal5,
                 "UAssetApiPath",
                 "atenfyr/UAssetGUI",
-                r"UAssetGUI.*\.zip$|.*UAssetGUI.*(win|Windows|x64).*\.zip$|.*(win|Windows|x64).*\.zip$",
+                r"^UAssetGUI\.exe$|UAssetGUI.*\.zip$|.*UAssetGUI.*(win|Windows|x64).*\.zip$|.*(win|Windows|x64).*\.zip$",
                 Path(install_dir) / "UAssetGUI",
                 "UAssetGUI.exe",
                 "UAssetGUI / UAssetAPI-compatible parser",
@@ -771,16 +870,7 @@ class WorkshopAnalysis:
             )
 
         if not as_path(unreal5.get("KismetAnalyzerPath")):
-            self.install_unreal_github_tool(
-                unreal5,
-                "KismetAnalyzerPath",
-                "trumank/kismet-analyzer",
-                r"kismet-analyzer.*(win|windows|x86_64|amd64).*\.zip$|.*(win|windows).*\.zip$|.*\.zip$",
-                Path(install_dir) / "kismet-analyzer",
-                "kismet-analyzer.exe",
-                "kismet-analyzer",
-                automatic=True,
-            )
+            self.install_kismet_analyzer(unreal5, install_dir, automatic=True)
 
         if not as_path(unreal5.get("UnrealPakPath")) and not automatic:
             unreal_pak = self.prompt_unrealpak_path(unreal5)
@@ -829,7 +919,7 @@ class WorkshopAnalysis:
         missing = self.unreal5_missing_required_tools(config)
         if missing:
             print(
-                "ERROR: UE5 analysis requires {0}. Configure the missing executable(s) and run analysis again.".format(
+                "WARNING: UE5 package coverage is incomplete without {0}. Analysis will continue and record blocked containers.".format(
                     ", ".join(missing)
                 )
             )
@@ -856,13 +946,6 @@ class WorkshopAnalysis:
 
         if game_type_id == "unreal5":
             self.ensure_unreal5_tools(config, automatic=True)
-            missing = self.unreal5_missing_required_tools(config)
-            if missing:
-                raise RuntimeError(
-                    "UE5 analysis setup is incomplete. Missing or invalid required tool(s): {0}.".format(
-                        ", ".join(missing)
-                    )
-                )
         elif game_type_id == "source2":
             return
         else:
