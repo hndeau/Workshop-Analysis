@@ -72,7 +72,6 @@ WorkshopAnalysis> bootstrap
 WorkshopAnalysis> download
 WorkshopAnalysis> download 730 3735111145 --type source2 --anonymous
 WorkshopAnalysis> analyze
-WorkshopAnalysis> update
 WorkshopAnalysis> catalog
 WorkshopAnalysis> status
 WorkshopAnalysis> exit
@@ -96,7 +95,7 @@ Use `reconfigure` later to revisit bootstrap settings without deleting catalog d
 
 When adding games, enter the Steam AppID first. The tool attempts to resolve the game title from Steam app metadata and uses it as the title default. When adding workshop content, enter the Workshop ContentID first. The tool attempts to resolve the workshop title from Steam's published-file metadata and uses it as the title default. Manual title entry remains available when either lookup is unavailable or incorrect.
 
-Use `update` to re-download cataloged workshop content. It can update all workshop items, selected workshop items across the catalog, or selected items for one game. Blank input accepts obvious defaults; in update selection, blank input selects all listed workshop content.
+Use `catalog` to re-download cataloged workshop content. From the catalog menu, `U` updates all or selected workshop items across the catalog. From a specific game menu, `U` updates all or selected workshop items for that game. Blank input accepts obvious defaults; in update selection, blank input selects all listed workshop content.
 
 After a download, Workshop Analysis prints a file inventory with file count, total size, extension counts, detected VPK/pak/utoc/ucas package files, interesting metadata such as `publish_data.txt`, and executable/script-like files worth reviewing. The guided flow then offers inline actions:
 
@@ -117,7 +116,9 @@ Each analysis writes a full raw report to `state\analysis\<AppID>\<ContentID>\an
 
 Source 2 analysis currently scans downloaded files, safely expands ZIP archives, parses VPK directory files to list contained package entries, records archive/VPK parsing errors as events, and marks the downloaded content as analyzed.
 
-Unreal Engine 5 analysis uses the same report flow. It scans downloaded files, safely expands ZIP archives, classifies UE package/config/script files, records pak/IO Store containers, and uses configured tools when available: `retoc` lists `.utoc`/`.ucas` IO Store contents, and `UnrealPak.exe` lists `.pak` contents when an Unreal Engine path has been configured. During analysis bootstrap the app automatically attempts to install retoc and FModel into the configured UE5 tool directory; UnrealPak must still come from an Unreal Engine installation.
+Unreal Engine 5 analysis uses the same report flow. It scans downloaded files, safely expands ZIP archives, classifies UE package/config/script files, records pak/IO Store containers, and uses configured tools when available: `retoc` lists and extracts `.utoc`/`.ucas` IO Store contents, and `UnrealPak.exe` lists and extracts `.pak` contents into `state\analysis\<AppID>\<ContentID>\extracted`. During analysis bootstrap the app attempts to install every supported distributable UE parser/hook into the configured UE5 tool directory: retoc, FModel as the CUE4Parse-backed parser, UAssetGUI/UAssetAPI-compatible tooling, and kismet-analyzer. It also discovers common Unreal Engine installs for `UnrealPak.exe`, discovers local Oodle runtime DLLs when present, creates the `.usmap` mappings directory, and validates required tools with harmless help commands. UE5 is considered analysis-ready only when both `retoc.exe` and `UnrealPak.exe` are configured and validated. `UnrealPak.exe` is distributed with Unreal Engine under `Engine\Binaries\Win64\UnrealPak.exe`; point the bootstrap prompt at either that executable or the Unreal Engine install directory if auto-discovery does not find it.
+
+UE5 reports now separate evidence from interpretation. `analysis.json` includes tool status, normalized container records, container entries, extracted files, loose/extracted script/config findings with hashes and safe previews, best-effort `AssetRegistry.bin` string recovery, cooked Blueprint/data-logic asset findings, and explicit blockers for missing parsers, missing `.usmap` mappings, missing Oodle support, encrypted content, and missing Kismet analysis support. Advanced paths can still be configured later for alternate CUE4Parse/FModel-compatible parsers, UAssetAPI/UAssetGUI-compatible parsers, `kismet-analyzer`, `.usmap` mappings, `Crypto.json` or an AES key, and Oodle. These hooks improve cooked asset and Blueprint bytecode recovery when the external backend supports it; the tool does not claim to recover original C++ source from cooked packages.
 
 You can also run one command and exit, similar to tools like SBT:
 
@@ -125,7 +126,6 @@ You can also run one command and exit, similar to tools like SBT:
 .\WorkshopAnalysis download
 .\WorkshopAnalysis download 730 3735111145 --type source2 --anonymous
 .\WorkshopAnalysis analyze
-.\WorkshopAnalysis update
 .\WorkshopAnalysis catalog
 .\WorkshopAnalysis status
 ```
@@ -160,7 +160,7 @@ The catalog manager supports:
 - Add, edit, and remove workshop content associated with a game.
 - Prompt to download/install newly added workshop content immediately.
 - Status badges for workshop items, including downloaded/not downloaded, tool ready, needs extraction, analysis complete, and last updated.
-- Re-download all or selected workshop content with the `update` command.
+- Re-download all or selected workshop content from the catalog or game menus.
 - Purge downloaded workshop content when removing a workshop item.
 - Purge all associated workshop content when removing a game.
 

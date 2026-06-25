@@ -324,6 +324,43 @@ class CatalogManagementTests(WorkshopAnalysisTestCase):
         self.assertEqual(items[0]["Title"], "Item B")
         self.assertEqual(items[0]["ContentId"], "333")
 
+    def test_catalog_menu_exposes_catalog_update(self):
+        app = self.app()
+        paths = app.state_paths()
+        db = self.database()
+        config = self.config(app)
+        called = []
+
+        def fake_update(update_paths, update_config, update_database):
+            called.append((update_paths, update_config, update_database))
+
+        with mock.patch.object(app, "update_all_catalog_downloads", side_effect=fake_update):
+            self.run_quietly(
+                lambda: app.manage_catalog(config, db, paths),
+                inputs=["u", "q"],
+            )
+
+        self.assertEqual(called, [(paths, config, db)])
+
+    def test_game_menu_exposes_game_update(self):
+        app = self.app()
+        paths = app.state_paths()
+        db = self.database()
+        config = self.config(app)
+        game = db.create_game("Game", "100", "source2")
+        called = []
+
+        def fake_update(update_paths, update_config, update_database, update_game):
+            called.append((update_paths, update_config, update_database, update_game["Id"]))
+
+        with mock.patch.object(app, "update_workshop_downloads_for_game", side_effect=fake_update):
+            self.run_quietly(
+                lambda: app.manage_game(paths, config, db, game),
+                inputs=["u", "b"],
+            )
+
+        self.assertEqual(called, [(paths, config, db, game["Id"])])
+
     def test_add_workshop_content_can_install_immediately(self):
         app = self.app(no_tool_bootstrap=True)
         paths = app.state_paths()
@@ -720,15 +757,47 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         unrealpak.parent.mkdir(parents=True)
         unrealpak.write_text("exe", encoding="utf-8")
 
-        with mock.patch("workshop_analysis_app.app.install_zip_tool_from_github", side_effect=RuntimeError("no asset")):
+        with mock.patch(
+            "workshop_analysis_app.app.install_zip_tool_from_github",
+            side_effect=RuntimeError("no asset"),
+        ), mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="usage"),
+        ):
             self.run_quietly(
                 lambda: app.ensure_unreal5_tools(config),
-                inputs=[str(install_dir), "y", str(retoc), "n", str(engine_dir)],
+                inputs=[str(install_dir), "y", str(retoc), "n", str(engine_dir), "", "", "", "", "", ""],
             )
 
         self.assertTrue(config["Tools"]["Unreal5"]["Installed"])
         self.assertEqual(config["Tools"]["Unreal5"]["RetocPath"], str(retoc))
         self.assertEqual(config["Tools"]["Unreal5"]["UnrealPakPath"], str(unrealpak))
+        self.assertTrue(config["Tools"]["Unreal5"]["Validation"]["RetocPath"]["Ok"])
+        self.assertTrue(config["Tools"]["Unreal5"]["Validation"]["UnrealPakPath"]["Ok"])
+
+    def test_unreal_tool_ready_requires_retoc_and_unrealpak_validation(self):
+        app = self.app()
+        config = self.config(app)
+        unreal5 = config["Tools"]["Unreal5"]
+        retoc = self.temp_dir / "tools" / "retoc.exe"
+        unrealpak = self.temp_dir / "tools" / "UnrealPak.exe"
+        retoc.parent.mkdir(parents=True)
+        retoc.write_text("retoc", encoding="utf-8")
+        unrealpak.write_text("unrealpak", encoding="utf-8")
+        unreal5["RetocPath"] = str(retoc)
+
+        self.assertFalse(app.tool_ready_for_game_type(config, "unreal5"))
+
+        unreal5["UnrealPakPath"] = str(unrealpak)
+        self.assertFalse(app.tool_ready_for_game_type(config, "unreal5"))
+
+        with mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="usage"),
+        ):
+            self.run_quietly(lambda: app.validate_unreal5_required_tools(config))
+
+        self.assertTrue(app.tool_ready_for_game_type(config, "unreal5"))
 
     def test_ensure_tools_for_game_type_respects_skip_and_rejects_unknown_type(self):
         skipped = self.app(no_tool_bootstrap=True)
@@ -932,7 +1001,96 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         self.assertIn("Content/Blueprints/BP_Test.uasset", auto_paths)
         self.assertIn("Content/Scripts/Logic.uasset", auto_paths)
         self.assertIn("Content/Config/Data.ini", auto_paths)
-        self.assertEqual(full_report["Summary"]["ToolInvocationCount"], 2)
+        self.assertEqual(full_report["Summary"]["ToolInvocationCount"], 4)
+        self.assertEqual(full_report["Summary"]["ContainerEntryCount"], 3)
+
+    def test_unreal5_analysis_extracts_and_scans_cooked_assets_with_optional_tools(self):
+        app = self.app()
+        tools_dir = self.temp_dir / "tools"
+        retoc = tools_dir / "retoc.exe"
+        unrealpak = tools_dir / "UnrealPak.exe"
+        uasset_parser = tools_dir / "uasset-parser.exe"
+        kismet = tools_dir / "kismet-analyzer.exe"
+        mappings_dir = tools_dir / "mappings"
+        for path in (retoc, unrealpak, uasset_parser, kismet):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(path.name, encoding="utf-8")
+        mappings_dir.mkdir(parents=True)
+        (mappings_dir / "game.usmap").write_text("mappings", encoding="utf-8")
+
+        analyzer = wa.WorkshopAnalyzer(
+            app.state_paths()["ConfigPath"].parent,
+            tool_config={
+                "Unreal5": {
+                    "RetocPath": str(retoc),
+                    "UnrealPakPath": str(unrealpak),
+                    "UAssetApiPath": str(uasset_parser),
+                    "KismetAnalyzerPath": str(kismet),
+                    "MappingsDir": str(mappings_dir),
+                }
+            },
+        )
+        content_dir = self.temp_dir / "ue5-deep-content"
+        (content_dir / "Content" / "Paks").mkdir(parents=True)
+        (content_dir / "Content" / "Paks" / "pakchunk0-Windows.pak").write_text("pak", encoding="utf-8")
+        (content_dir / "Content" / "Paks" / "pakchunk0-Windows.utoc").write_text("utoc", encoding="utf-8")
+        (content_dir / "Content" / "Paks" / "pakchunk0-Windows.ucas").write_text("ucas", encoding="utf-8")
+        game = {"Title": "UE Game", "AppId": "500", "GameTypeId": "unreal5"}
+        item = {"Title": "Item", "ContentId": "600"}
+
+        def fake_tool(command, check=False, **kwargs):
+            command_text = " ".join(str(part) for part in command)
+            if "UnrealPak" in command_text and "-Extract" in command:
+                target = Path(command[command.index("-Extract") + 1])
+                (target / "Content" / "Blueprints").mkdir(parents=True, exist_ok=True)
+                (target / "Config").mkdir(parents=True, exist_ok=True)
+                (target / "Content" / "Blueprints" / "BP_Test.uasset").write_text("asset", encoding="utf-8")
+                (target / "Config" / "DefaultGame.ini").write_text("[Game]", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="Extracted")
+            if "UnrealPak" in command_text:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="LogPakFile: Display: Content/Blueprints/BP_Test.uasset\nConfig/DefaultGame.ini\n",
+                )
+            if "retoc" in command_text and "unpack" in command:
+                target = Path(command[-1])
+                (target / "Content" / "Data").mkdir(parents=True, exist_ok=True)
+                (target / "Content" / "Data" / "DT_Items.uasset").write_text("asset", encoding="utf-8")
+                (target / "AssetRegistry.bin").write_bytes(
+                    b"/Game/Blueprints/BP_Test\x00/Game/Data/DT_Items\x00"
+                )
+                return SimpleNamespace(returncode=0, stdout="Extracted 2")
+            if "retoc" in command_text:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Content/Data/DT_Items.uasset\nAssetRegistry.bin\n",
+                )
+            if "kismet-analyzer" in command_text:
+                return SimpleNamespace(returncode=0, stdout="Function ExecuteUbergraph_BP_Test")
+            return SimpleNamespace(returncode=0, stdout='{"exports":[]}')
+
+        with mock.patch("subprocess.run", side_effect=fake_tool):
+            result = analyzer.analyze(game, item, content_dir, "auto")
+
+        full_report = json.loads(Path(result["ReportPath"]).read_text(encoding="utf-8"))
+        extracted_paths = {item["RelativePath"] for item in full_report["ExtractedFiles"]}
+        script_paths = {item["RelativePath"] for item in full_report["ScriptFindings"]}
+        blueprint_paths = {item["Path"] for item in full_report["BlueprintFindings"]}
+        data_logic_paths = {item["Path"] for item in full_report["DataLogicFindings"]}
+
+        self.assertTrue(any(path.endswith("Content/Blueprints/BP_Test.uasset") for path in extracted_paths))
+        self.assertTrue(any(path.endswith("Config/DefaultGame.ini") for path in script_paths))
+        self.assertIn("Content/Blueprints/BP_Test.uasset", blueprint_paths)
+        self.assertIn("Content/Data/DT_Items.uasset", data_logic_paths)
+        self.assertTrue(full_report["AssetRegistry"]["Assets"])
+        self.assertTrue(all(container["ExtractionStatus"] == "extracted" for container in full_report["Containers"]))
+        self.assertTrue(full_report["ContainerEntries"])
+        self.assertTrue(
+            any(
+                finding.get("Kismet", {}).get("OutputPreview") == "Function ExecuteUbergraph_BP_Test"
+                for finding in full_report["BlueprintFindings"]
+            )
+        )
 
     def test_unreal5_analysis_records_missing_tools_and_iostore_pair_errors(self):
         app = self.app()
@@ -946,10 +1104,20 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
 
         result = analyzer.analyze(game, item, content_dir, "auto")
         event_types = [event["Type"] for event in result["Events"]]
+        event_levels = {event["Type"]: event["Level"] for event in result["Events"]}
+        full_report = json.loads(Path(result["ReportPath"]).read_text(encoding="utf-8"))
 
         self.assertIn("pak_listing_tool_missing", event_types)
         self.assertIn("iostore_listing_tool_missing", event_types)
         self.assertIn("iostore_ucas_missing", event_types)
+        self.assertEqual(event_levels["pak_listing_tool_missing"], "error")
+        self.assertEqual(event_levels["iostore_listing_tool_missing"], "error")
+        self.assertTrue(
+            any("UnrealPak.exe" in event["Message"] for event in full_report["Events"])
+        )
+        self.assertFalse(full_report["Tools"]["UnrealPakPath"]["Configured"])
+        self.assertEqual(full_report["Containers"][0]["ExtractionStatus"], "blocked_missing_tool")
+        self.assertIn("blocked_missing_tool", {item["Reason"] for item in full_report["BlockedItems"]})
 
     def test_unreal5_analysis_bootstrap_downloads_tools_automatically(self):
         app = self.app()
@@ -965,23 +1133,48 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
 
         retoc_path = self.temp_dir / "retoc" / "retoc.exe"
         fmodel_path = self.temp_dir / "fmodel" / "FModel.exe"
+        uasset_path = self.temp_dir / "uassetgui" / "UAssetGUI.exe"
+        kismet_path = self.temp_dir / "kismet" / "kismet-analyzer.exe"
+        unrealpak_path = self.temp_dir / "UE" / "Engine" / "Binaries" / "Win64" / "UnrealPak.exe"
+        unrealpak_path.parent.mkdir(parents=True)
+        unrealpak_path.write_text("unrealpak", encoding="utf-8")
+        config["Tools"]["Unreal5"]["UnrealPakPath"] = str(unrealpak_path)
 
         def fake_install(repository, pattern, install_dir, executable_name):
             if executable_name == "retoc.exe":
                 retoc_path.parent.mkdir(parents=True, exist_ok=True)
                 retoc_path.write_text("retoc", encoding="utf-8")
                 return str(retoc_path)
+            if executable_name == "UAssetGUI.exe":
+                uasset_path.parent.mkdir(parents=True, exist_ok=True)
+                uasset_path.write_text("uasset", encoding="utf-8")
+                return str(uasset_path)
+            if executable_name == "kismet-analyzer.exe":
+                kismet_path.parent.mkdir(parents=True, exist_ok=True)
+                kismet_path.write_text("kismet", encoding="utf-8")
+                return str(kismet_path)
             fmodel_path.parent.mkdir(parents=True, exist_ok=True)
             fmodel_path.write_text("fmodel", encoding="utf-8")
             return str(fmodel_path)
 
-        with mock.patch("workshop_analysis_app.app.install_zip_tool_from_github", side_effect=fake_install):
+        with mock.patch(
+            "workshop_analysis_app.app.install_zip_tool_from_github",
+            side_effect=fake_install,
+        ), mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="usage"),
+        ):
             self.run_quietly(
                 lambda: app.run_game_analysis(paths, config, game, db.get_workshop_content(item["Id"]), content_dir, "auto")
             )
 
         self.assertEqual(config["Tools"]["Unreal5"]["RetocPath"], str(retoc_path))
         self.assertEqual(config["Tools"]["Unreal5"]["FModelPath"], str(fmodel_path))
+        self.assertEqual(config["Tools"]["Unreal5"]["CUE4ParsePath"], str(fmodel_path))
+        self.assertEqual(config["Tools"]["Unreal5"]["UAssetApiPath"], str(uasset_path))
+        self.assertEqual(config["Tools"]["Unreal5"]["KismetAnalyzerPath"], str(kismet_path))
+        self.assertEqual(config["Tools"]["Unreal5"]["UnrealPakPath"], str(unrealpak_path))
+        self.assertTrue(config["Tools"]["Unreal5"]["Installed"])
 
     def test_analyze_command_uses_game_type_and_prompts_only_for_mode(self):
         app = self.app()
@@ -1142,6 +1335,49 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
             )
 
         self.assertEqual(downloaded, [("101", "201")])
+
+    def test_update_reuses_non_anonymous_steam_username_for_same_game(self):
+        app = self.app(no_tool_bootstrap=True)
+        paths = app.state_paths()
+        config = self.config(app)
+        config["Defaults"]["UseAnonymousSteam"] = False
+        Path(config["SteamCmd"]["ExePath"]).parent.mkdir(parents=True)
+        Path(config["SteamCmd"]["ExePath"]).write_text("", encoding="utf-8")
+        wa.save_json_file(paths["ConfigPath"], config)
+
+        db = self.database()
+        game = db.create_game("Game", "100", "source2")
+        db.create_workshop_content(game["Id"], "Item A", "200")
+        db.create_workshop_content(game["Id"], "Item B", "201")
+        commands = []
+
+        def fake_steamcmd(command, check=False, **kwargs):
+            commands.append(command)
+            app_id = command[command.index("+workshop_download_item") + 1]
+            content_id = command[command.index("+workshop_download_item") + 2]
+            content_dir = (
+                Path(config["Defaults"]["WorkshopDownloadRoot"])
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / app_id
+                / content_id
+            )
+            content_dir.mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(returncode=0, stdout="Success. Downloaded item")
+
+        with mock.patch("subprocess.run", side_effect=fake_steamcmd):
+            self.run_quietly(
+                lambda: app.update_workshop_downloads_for_game(paths, config, db, game),
+                inputs=["", "steam-user"],
+            )
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(
+            [command[command.index("+login") + 1] for command in commands],
+            ["steam-user", "steam-user"],
+        )
+        self.assertEqual(app.steam_username_cache[game["AppId"]], "steam-user")
 
     def test_cs2_workshop_fixture_catalog_contains_known_anonymous_items(self):
         app = self.app(no_tool_bootstrap=True)
@@ -1341,6 +1577,11 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         app = self.app()
         self.run_quietly(lambda: app.execute_command(["status"]))
         self.run_quietly(lambda: app.execute_command(["bogus"]))
+        with mock.patch.object(app, "update_catalog_downloads") as update_catalog:
+            self.run_quietly(lambda: app.execute_command(["update"]))
+        update_catalog.assert_not_called()
+        self.assertEqual(app.tokens_for_terminal_action("c", True), ["catalog"])
+        self.assertEqual(app.tokens_for_terminal_action("u", True), ["u"])
         self.assertFalse(app.execute_command(["exit"]))
 
 

@@ -34,6 +34,19 @@ from .tooling import (
 
 
 class WorkshopAnalysis:
+    UNREAL5_REQUIRED_TOOLS = {
+        "RetocPath": {
+            "DisplayName": "retoc.exe",
+            "ValidationArgs": ["--help"],
+            "AcceptedExitCodes": (0,),
+        },
+        "UnrealPakPath": {
+            "DisplayName": "UnrealPak.exe",
+            "ValidationArgs": ["-help"],
+            "AcceptedExitCodes": (0, 1),
+        },
+    }
+
     ANSI_COLORS = {
         "reset": "\033[0m",
         "bold": "\033[1m",
@@ -74,6 +87,7 @@ class WorkshopAnalysis:
         self.state_root = Path(state_root)
         self.no_tool_bootstrap = no_tool_bootstrap
         self.debug = debug
+        self.steam_username_cache = {}
 
     def new_default_config(self):
         tool_root = self.state_root / "tools"
@@ -104,7 +118,16 @@ class WorkshopAnalysis:
                     "RetocPath": None,
                     "FModelPath": None,
                     "UnrealPakPath": None,
+                    "CUE4ParsePath": None,
+                    "UAssetApiPath": None,
+                    "KismetAnalyzerPath": None,
                     "UnrealEngineDir": None,
+                    "MappingsDir": str(tool_root / "unreal5" / "mappings"),
+                    "CryptoKeysFile": None,
+                    "AesKey": None,
+                    "OodlePath": None,
+                    "EngineVersion": "auto",
+                    "Validation": {},
                 },
             },
         }
@@ -203,12 +226,36 @@ class WorkshopAnalysis:
             cli_path = as_path(config.get("Tools", {}).get("Source2", {}).get("CliPath"))
             return bool(cli_path and cli_path.exists())
         if game_type_id == "unreal5":
-            unreal5 = config.get("Tools", {}).get("Unreal5", {})
-            for key in ("RetocPath", "FModelPath", "UnrealPakPath"):
-                tool_path = as_path(unreal5.get(key))
-                if tool_path and tool_path.exists():
-                    return True
+            return WorkshopAnalysis.unreal5_required_tools_ready(config)
         return False
+
+    @staticmethod
+    def unreal5_tool_validation_is_current(unreal5, key):
+        tool_path = as_path(unreal5.get(key))
+        validation = unreal5.get("Validation", {}).get(key, {})
+        return bool(
+            tool_path
+            and tool_path.exists()
+            and validation.get("Ok")
+            and validation.get("Path") == str(tool_path)
+        )
+
+    @staticmethod
+    def unreal5_required_tools_ready(config):
+        unreal5 = config.get("Tools", {}).get("Unreal5", {})
+        return all(
+            WorkshopAnalysis.unreal5_tool_validation_is_current(unreal5, key)
+            for key in WorkshopAnalysis.UNREAL5_REQUIRED_TOOLS
+        )
+
+    @staticmethod
+    def unreal5_missing_required_tools(config):
+        unreal5 = config.get("Tools", {}).get("Unreal5", {})
+        missing = []
+        for key, metadata in WorkshopAnalysis.UNREAL5_REQUIRED_TOOLS.items():
+            if not WorkshopAnalysis.unreal5_tool_validation_is_current(unreal5, key):
+                missing.append(metadata["DisplayName"])
+        return missing
 
     @staticmethod
     def analysis_complete_for_path(content_path):
@@ -417,13 +464,256 @@ class WorkshopAnalysis:
 
         source2["InstallDir"] = install_dir
 
+    @staticmethod
+    def unrealpak_path_from_engine_dir(engine_dir):
+        engine_dir = as_path(engine_dir)
+        if not engine_dir:
+            return None
+
+        candidates = [
+            engine_dir / "Engine" / "Binaries" / "Win64" / "UnrealPak.exe",
+            engine_dir / "Binaries" / "Win64" / "UnrealPak.exe",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    @staticmethod
+    def common_unreal_engine_roots():
+        roots = []
+        for variable in ("UNREAL_ENGINE_DIR", "UE_ENGINE_DIR", "UE_ROOT"):
+            value = os.environ.get(variable)
+            if value:
+                roots.append(Path(value))
+
+        for variable in ("ProgramFiles", "ProgramW6432"):
+            base = os.environ.get(variable)
+            if not base:
+                continue
+            epic_root = Path(base) / "Epic Games"
+            if epic_root.exists():
+                roots.extend(sorted(epic_root.glob("UE_5*"), reverse=True))
+
+        return roots
+
+    def discover_unrealpak_path(self, unreal5):
+        configured = as_path(unreal5.get("UnrealPakPath"))
+        if configured and configured.exists():
+            return configured
+
+        engine_path = self.unrealpak_path_from_engine_dir(unreal5.get("UnrealEngineDir"))
+        if engine_path:
+            return engine_path
+
+        for engine_root in self.common_unreal_engine_roots():
+            engine_path = self.unrealpak_path_from_engine_dir(engine_root)
+            if engine_path:
+                return engine_path
+        return None
+
+    def discover_oodle_path(self, unreal5):
+        configured = as_path(unreal5.get("OodlePath"))
+        if configured and configured.exists():
+            return configured
+
+        candidates = []
+        engine_dir = as_path(unreal5.get("UnrealEngineDir"))
+        if engine_dir:
+            candidates.extend(engine_dir.rglob("oo2core*_win64.dll"))
+            candidates.extend(engine_dir.rglob("oo2core*.dll"))
+
+        for engine_root in self.common_unreal_engine_roots():
+            candidates.extend(engine_root.rglob("oo2core*_win64.dll"))
+            candidates.extend(engine_root.rglob("oo2core*.dll"))
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @staticmethod
+    def infer_unreal_engine_dir_from_unrealpak(unreal_pak_path):
+        path = Path(unreal_pak_path)
+        parts = path.parts
+        lowered = [part.lower() for part in parts]
+        if "engine" not in lowered:
+            return None
+        engine_index = lowered.index("engine")
+        if engine_index == 0:
+            return None
+        return Path(*parts[:engine_index])
+
+    def prompt_unrealpak_path(self, unreal5):
+        answer = input(
+            "Optional path to UnrealPak.exe or Unreal Engine install dir (blank to skip): "
+        ).strip()
+        if not answer:
+            return None
+
+        path = Path(answer).expanduser()
+        if path.is_file() and path.name.lower() == "unrealpak.exe":
+            return path
+
+        engine_path = self.unrealpak_path_from_engine_dir(path)
+        if engine_path:
+            return engine_path
+
+        direct_candidate = path / "UnrealPak.exe"
+        if direct_candidate.exists():
+            return direct_candidate
+
+        print("WARNING: UnrealPak.exe was not found from {0}".format(path))
+        return None
+
+    @staticmethod
+    def prompt_optional_existing_path(prompt, default=None):
+        suffix = " [{0}]".format(default) if default else ""
+        answer = input("{0}{1}: ".format(prompt, suffix)).strip()
+        if not answer and default:
+            answer = str(default)
+        if not answer:
+            return None
+        path = Path(answer).expanduser()
+        if path.exists():
+            return str(path)
+        print("WARNING: Path does not exist: {0}".format(path))
+        return None
+
+    def install_unreal_github_tool(
+        self,
+        unreal5,
+        key,
+        repository,
+        asset_name_regex,
+        install_dir,
+        expected_exe_name,
+        display_name,
+        automatic=False,
+    ):
+        existing = as_path(unreal5.get(key))
+        if existing and existing.exists():
+            return existing
+
+        try:
+            print("Installing {0}...".format(display_name))
+            installed = install_zip_tool_from_github(
+                repository,
+                asset_name_regex,
+                install_dir,
+                expected_exe_name,
+            )
+            unreal5[key] = installed
+            return Path(installed)
+        except Exception as exc:
+            print("WARNING: {0} auto-install failed: {1}".format(display_name, exc))
+            unreal5.setdefault("SetupWarnings", []).append(
+                {
+                    "Tool": display_name,
+                    "Repository": repository,
+                    "Error": str(exc),
+                    "CheckedUtc": utc_now_iso(),
+                }
+            )
+            if not automatic:
+                manual_path = self.prompt_optional_existing_path(
+                    "Optional path to existing {0}".format(expected_exe_name)
+                )
+                if manual_path:
+                    unreal5[key] = manual_path
+                    return Path(manual_path)
+        return None
+
+    @staticmethod
+    def tool_output_preview(output, limit=600):
+        text = (output or "").strip().replace("\r\n", "\n")
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
+
+    def validate_external_tool(self, tool_name, tool_path, validation_args, accepted_exit_codes):
+        tool_path = Path(tool_path)
+        command = [str(tool_path)] + list(validation_args)
+        validation = {
+            "Path": str(tool_path),
+            "Command": command,
+            "CheckedUtc": utc_now_iso(),
+            "Ok": False,
+            "ExitCode": None,
+            "OutputPreview": "",
+            "Error": "",
+        }
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            validation["ExitCode"] = result.returncode
+            validation["OutputPreview"] = self.tool_output_preview(getattr(result, "stdout", "") or "")
+            validation["Ok"] = result.returncode in accepted_exit_codes
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            validation["Error"] = str(exc)
+
+        if validation["Ok"]:
+            print("{0} validated at {1}".format(tool_name, tool_path))
+        else:
+            detail = validation.get("Error") or "exit code {0}".format(validation.get("ExitCode"))
+            print("WARNING: {0} validation failed for {1}: {2}".format(tool_name, tool_path, detail))
+        return validation
+
+    def validate_unreal5_required_tools(self, config):
+        unreal5 = config["Tools"]["Unreal5"]
+        validation = unreal5.setdefault("Validation", {})
+        for key, metadata in self.UNREAL5_REQUIRED_TOOLS.items():
+            tool_path = as_path(unreal5.get(key))
+            if not tool_path or not tool_path.exists():
+                validation[key] = {
+                    "Path": str(tool_path) if tool_path else None,
+                    "CheckedUtc": utc_now_iso(),
+                    "Ok": False,
+                    "Error": "{0} is not configured or does not exist.".format(metadata["DisplayName"]),
+                }
+                continue
+
+            validation[key] = self.validate_external_tool(
+                metadata["DisplayName"],
+                tool_path,
+                metadata["ValidationArgs"],
+                metadata["AcceptedExitCodes"],
+            )
+
     def ensure_unreal5_tools(self, config, automatic=False):
         unreal5 = config["Tools"]["Unreal5"]
+        unreal5.setdefault("MappingsDir", str(Path(unreal5.get("InstallDir") or config["Defaults"]["ToolRoot"]) / "mappings"))
+        unreal5.setdefault("CryptoKeysFile", None)
+        unreal5.setdefault("AesKey", None)
+        unreal5.setdefault("OodlePath", None)
+        unreal5.setdefault("EngineVersion", "auto")
+        unreal5.setdefault("CUE4ParsePath", None)
+        unreal5.setdefault("UAssetApiPath", None)
+        unreal5.setdefault("KismetAnalyzerPath", None)
+        unreal5.setdefault("SetupWarnings", [])
+        unreal5.setdefault("Validation", {})
+
         retoc_path = as_path(unreal5.get("RetocPath"))
         fmodel_path = as_path(unreal5.get("FModelPath"))
+        unreal_pak_path = self.discover_unrealpak_path(unreal5)
+        if unreal_pak_path:
+            unreal5["UnrealPakPath"] = str(unreal_pak_path)
+            engine_dir = self.infer_unreal_engine_dir_from_unrealpak(unreal_pak_path)
+            if engine_dir:
+                unreal5["UnrealEngineDir"] = str(engine_dir)
+        unreal_pak_path = as_path(unreal5.get("UnrealPakPath"))
         retoc_ok = retoc_path is not None and retoc_path.exists()
         fmodel_ok = fmodel_path is not None and fmodel_path.exists()
-        if unreal5.get("Installed") and (retoc_ok or fmodel_ok):
+        unreal_pak_ok = unreal_pak_path is not None and unreal_pak_path.exists()
+        if retoc_ok and unreal_pak_ok and self.unreal5_required_tools_ready(config):
             return
 
         write_section("Unreal Engine 5 tool setup")
@@ -440,7 +730,7 @@ class WorkshopAnalysis:
                 print("Installing retoc CLI...")
                 unreal5["RetocPath"] = install_zip_tool_from_github(
                     "trumank/retoc",
-                    r"retoc-x86_64-pc-windows-msvc\.zip$",
+                    r"retoc_cli-x86_64-pc-windows-msvc\.zip$|retoc.*x86_64.*windows.*\.zip$",
                     retoc_dir,
                     "retoc.exe",
                 )
@@ -455,41 +745,99 @@ class WorkshopAnalysis:
             automatic
             or prompt_yes_no("Install FModel portable build if a release asset is available?", True)
         ):
-            try:
-                fmodel_dir = Path(install_dir) / "FModel"
-                print("Installing FModel portable build...")
-                unreal5["FModelPath"] = install_zip_tool_from_github(
-                    "4sval/FModel",
-                    r"FModel.*(win|Windows|x64).*\.zip$|FModel.*\.zip$",
-                    fmodel_dir,
-                    "FModel.exe",
-                )
-            except Exception as exc:
-                print("WARNING: FModel auto-install failed: {0}".format(exc))
-                print("WARNING: You can install FModel manually later and store the path in config.json.")
+            fmodel_path = self.install_unreal_github_tool(
+                unreal5,
+                "FModelPath",
+                "4sval/FModel",
+                r"FModel.*(win|Windows|x64).*\.zip$|FModel.*\.zip$",
+                Path(install_dir) / "FModel",
+                "FModel.exe",
+                "FModel portable build",
+                automatic=automatic,
+            )
+            if fmodel_path and not unreal5.get("CUE4ParsePath"):
+                unreal5["CUE4ParsePath"] = str(fmodel_path)
 
-        engine_dir = ""
-        if automatic:
-            engine_dir = unreal5.get("UnrealEngineDir") or ""
-        else:
-            engine_dir = input("Optional Unreal Engine install dir for UnrealPak.exe (blank to skip): ").strip()
-        if engine_dir:
-            unreal_pak = Path(engine_dir) / "Engine" / "Binaries" / "Win64" / "UnrealPak.exe"
-            if unreal_pak.exists():
-                unreal5["UnrealEngineDir"] = engine_dir
+        if not as_path(unreal5.get("UAssetApiPath")):
+            self.install_unreal_github_tool(
+                unreal5,
+                "UAssetApiPath",
+                "atenfyr/UAssetGUI",
+                r"UAssetGUI.*\.zip$|.*UAssetGUI.*(win|Windows|x64).*\.zip$|.*(win|Windows|x64).*\.zip$",
+                Path(install_dir) / "UAssetGUI",
+                "UAssetGUI.exe",
+                "UAssetGUI / UAssetAPI-compatible parser",
+                automatic=True,
+            )
+
+        if not as_path(unreal5.get("KismetAnalyzerPath")):
+            self.install_unreal_github_tool(
+                unreal5,
+                "KismetAnalyzerPath",
+                "trumank/kismet-analyzer",
+                r"kismet-analyzer.*(win|windows|x86_64|amd64).*\.zip$|.*(win|windows).*\.zip$|.*\.zip$",
+                Path(install_dir) / "kismet-analyzer",
+                "kismet-analyzer.exe",
+                "kismet-analyzer",
+                automatic=True,
+            )
+
+        if not as_path(unreal5.get("UnrealPakPath")) and not automatic:
+            unreal_pak = self.prompt_unrealpak_path(unreal5)
+            if unreal_pak:
                 unreal5["UnrealPakPath"] = str(unreal_pak)
-            else:
-                print("WARNING: UnrealPak.exe was not found at {0}".format(unreal_pak))
+                engine_dir = self.infer_unreal_engine_dir_from_unrealpak(unreal_pak)
+                if engine_dir:
+                    unreal5["UnrealEngineDir"] = str(engine_dir)
+
+        if not as_path(unreal5.get("OodlePath")):
+            oodle_path = self.discover_oodle_path(unreal5)
+            if oodle_path:
+                unreal5["OodlePath"] = str(oodle_path)
+
+        if not automatic:
+            advanced_prompts = (
+                ("CUE4ParsePath", "Optional CUE4Parse/FModel-compatible parser executable"),
+                ("UAssetApiPath", "Optional UAssetAPI/UAssetGUI-compatible parser executable"),
+                ("KismetAnalyzerPath", "Optional kismet-analyzer executable"),
+                ("OodlePath", "Optional Oodle runtime/library path"),
+                ("CryptoKeysFile", "Optional Crypto.json path"),
+            )
+            for key, prompt in advanced_prompts:
+                if not unreal5.get(key):
+                    value = self.prompt_optional_existing_path(prompt)
+                    if value:
+                        unreal5[key] = value
+
+            if not unreal5.get("MappingsDir"):
+                mappings_dir = input("Optional .usmap mappings directory (blank for default): ").strip()
+                if mappings_dir:
+                    unreal5["MappingsDir"] = mappings_dir
+
+            if not unreal5.get("AesKey"):
+                aes_key = input("Optional AES key for encrypted UE containers (blank to skip): ").strip()
+                if aes_key:
+                    unreal5["AesKey"] = aes_key
 
         retoc_path = as_path(unreal5.get("RetocPath"))
         fmodel_path = as_path(unreal5.get("FModelPath"))
         unreal_pak_path = as_path(unreal5.get("UnrealPakPath"))
-        unreal5["Installed"] = bool(
-            (retoc_path and retoc_path.exists())
-            or (fmodel_path and fmodel_path.exists())
-            or (unreal_pak_path and unreal_pak_path.exists())
-        )
         unreal5["InstallDir"] = install_dir
+        ensure_directory(unreal5["MappingsDir"])
+        self.validate_unreal5_required_tools(config)
+        unreal5["Installed"] = self.unreal5_required_tools_ready(config)
+        missing = self.unreal5_missing_required_tools(config)
+        if missing:
+            print(
+                "ERROR: UE5 analysis requires {0}. Configure the missing executable(s) and run analysis again.".format(
+                    ", ".join(missing)
+                )
+            )
+            if "UnrealPak.exe" in missing:
+                print(
+                    "UnrealPak.exe is distributed with Unreal Engine under "
+                    "Engine\\Binaries\\Win64\\UnrealPak.exe."
+                )
 
     def ensure_tools_for_game_type(self, config, game_type_id):
         if self.no_tool_bootstrap:
@@ -508,6 +856,13 @@ class WorkshopAnalysis:
 
         if game_type_id == "unreal5":
             self.ensure_unreal5_tools(config, automatic=True)
+            missing = self.unreal5_missing_required_tools(config)
+            if missing:
+                raise RuntimeError(
+                    "UE5 analysis setup is incomplete. Missing or invalid required tool(s): {0}.".format(
+                        ", ".join(missing)
+                    )
+                )
         elif game_type_id == "source2":
             return
         else:
@@ -748,6 +1103,7 @@ class WorkshopAnalysis:
 
             print()
             print("[A] Add workshop content")
+            print("[U] Update downloads for this game")
             print("[E] Edit game")
             print("[R] Remove game")
             print("[B] Back")
@@ -757,6 +1113,9 @@ class WorkshopAnalysis:
                 return
             if answer in ("a", "add", "n", "new"):
                 self.add_workshop_content(paths, config, database, game)
+                continue
+            if answer in ("u", "update", "refresh"):
+                self.update_workshop_downloads_for_game(paths, config, database, game)
                 continue
             if answer in ("e", "edit"):
                 game = self.edit_game(config, database, game)
@@ -788,6 +1147,7 @@ class WorkshopAnalysis:
 
             print()
             print("[A] Add game")
+            print("[U] Update catalog downloads")
             print("[Q] Quit catalog management")
 
             answer = input("Select a game or action: ").strip().lower()
@@ -795,6 +1155,9 @@ class WorkshopAnalysis:
                 return
             if answer in ("a", "add", "n", "new"):
                 self.add_game(config, database)
+                continue
+            if answer in ("u", "update", "refresh"):
+                self.update_all_catalog_downloads(paths, config, database)
                 continue
 
             try:
@@ -905,7 +1268,29 @@ class WorkshopAnalysis:
                 return items[index - 1]
             print("WARNING: Invalid selection.")
 
-    def invoke_workshop_download(self, config, game, workshop_item):
+    @staticmethod
+    def username_cache_key_for_game(game):
+        return str(game.get("AppId") or game.get("Id") or "")
+
+    def prompt_steam_username_for_game(self, game, username_cache=None):
+        username_cache = username_cache if username_cache is not None else self.steam_username_cache
+        cache_key = self.username_cache_key_for_game(game)
+        if cache_key and cache_key in username_cache:
+            return username_cache[cache_key]
+
+        print()
+        print(
+            "SteamCMD will prompt for any required password or Steam Guard code. "
+            "Credentials are not stored by this program."
+        )
+        steam_username = prompt_non_empty(
+            "Steam username for {0} (not stored)".format(game.get("Title") or game.get("AppId"))
+        )
+        if cache_key:
+            username_cache[cache_key] = steam_username
+        return steam_username
+
+    def invoke_workshop_download(self, config, game, workshop_item, username_cache=None):
         steam_config = config["SteamCmd"]
         steamcmd_path = as_path(steam_config.get("ExePath"))
         if not steamcmd_path or not steamcmd_path.exists():
@@ -921,12 +1306,7 @@ class WorkshopAnalysis:
         if use_anonymous:
             login_args = ["+login", "anonymous"]
         else:
-            print()
-            print(
-                "SteamCMD will prompt for any required password or Steam Guard code. "
-                "Credentials are not stored by this program."
-            )
-            steam_username = prompt_non_empty("Steam username (not stored)")
+            steam_username = self.prompt_steam_username_for_game(game, username_cache)
             login_args = ["+login", steam_username]
 
         steamcmd_args = (
@@ -1372,6 +1752,11 @@ class WorkshopAnalysis:
             print("retoc: {0}".format(unreal5.get("RetocPath") or "not configured"))
             print("FModel: {0}".format(unreal5.get("FModelPath") or "not configured"))
             print("UnrealPak: {0}".format(unreal5.get("UnrealPakPath") or "not configured"))
+            print("CUE4Parse parser: {0}".format(unreal5.get("CUE4ParsePath") or "not configured"))
+            print("UAssetAPI parser: {0}".format(unreal5.get("UAssetApiPath") or "not configured"))
+            print("Kismet analyzer: {0}".format(unreal5.get("KismetAnalyzerPath") or "not configured"))
+            print("Mappings: {0}".format(unreal5.get("MappingsDir") or "not configured"))
+            print("Oodle: {0}".format(unreal5.get("OodlePath") or "not configured"))
         else:
             print("No extraction action is available for game type '{0}'.".format(game_type_id))
         print("Content path: {0}".format(content_path))
@@ -1442,6 +1827,11 @@ class WorkshopAnalysis:
             print("  retoc: {0}".format(unreal5.get("RetocPath")))
             print("  FModel: {0}".format(unreal5.get("FModelPath")))
             print("  UnrealPak: {0}".format(unreal5.get("UnrealPakPath")))
+            print("  CUE4Parse parser: {0}".format(unreal5.get("CUE4ParsePath")))
+            print("  UAssetAPI parser: {0}".format(unreal5.get("UAssetApiPath")))
+            print("  Kismet analyzer: {0}".format(unreal5.get("KismetAnalyzerPath")))
+            print("  Mappings: {0}".format(unreal5.get("MappingsDir")))
+            print("  Oodle: {0}".format(unreal5.get("OodlePath")))
         else:
             print("No analysis plan exists for '{0}'.".format(game_type_id))
 
@@ -1454,6 +1844,13 @@ class WorkshopAnalysis:
         database.migrate_legacy_json(paths["LegacyJsonDbPath"])
         return paths, has_config, config, database
 
+    def ensure_config_for_download_actions(self, paths, config):
+        if paths["ConfigPath"].exists():
+            return config
+        print("No configuration was found. Running bootstrap first.")
+        self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+        return config
+
     def download_and_record_workshop_content(
         self,
         paths,
@@ -1463,6 +1860,7 @@ class WorkshopAnalysis:
         workshop_item,
         prompt_for_game_type=True,
         ensure_tools=True,
+        username_cache=None,
     ):
         if prompt_for_game_type:
             game = self.prompt_game_type_for_game(config, database, game)
@@ -1471,7 +1869,7 @@ class WorkshopAnalysis:
         if ensure_tools:
             self.ensure_tools_for_game_type(config, game_type_id)
 
-        download_path = self.invoke_workshop_download(config, game, workshop_item)
+        download_path = self.invoke_workshop_download(config, game, workshop_item, username_cache)
         downloaded_at = utc_now_iso()
         database.update_workshop_download(workshop_item["Id"], downloaded_at, download_path)
         workshop_item["LastDownloadUtc"] = downloaded_at
@@ -1735,10 +2133,49 @@ class WorkshopAnalysis:
                 )
         return candidates
 
+    def update_selected_workshop_downloads(self, paths, config, database, candidates):
+        selected = self.prompt_workshop_update_selection(candidates)
+        if not selected:
+            print("No workshop content selected for update.")
+            return 0
+
+        updated = 0
+        for candidate in selected:
+            game = candidate["Game"]
+            workshop_item = candidate["WorkshopItem"]
+            print()
+            print(
+                "Updating {0}".format(
+                    self.describe_game_with_content(game, workshop_item)
+                )
+            )
+            self.download_and_record_workshop_content(
+                paths,
+                config,
+                database,
+                game,
+                workshop_item,
+                username_cache=self.steam_username_cache,
+            )
+            updated += 1
+
+        print()
+        print("Updated {0} workshop item(s).".format(updated))
+        return updated
+
+    def update_workshop_downloads_for_game(self, paths, config, database, game):
+        config = self.ensure_config_for_download_actions(paths, config)
+        candidates = self.collect_update_candidates(database, game, config)
+        self.update_selected_workshop_downloads(paths, config, database, candidates)
+
+    def update_all_catalog_downloads(self, paths, config, database):
+        config = self.ensure_config_for_download_actions(paths, config)
+        candidates = self.collect_update_candidates(database, config=config)
+        self.update_selected_workshop_downloads(paths, config, database, candidates)
+
     def update_catalog_downloads(self, paths, has_config, config, database):
         if not has_config:
-            print("No configuration was found. Running bootstrap first.")
-            self.invoke_bootstrap(config, paths["ConfigPath"], paths["DbPath"])
+            self.ensure_config_for_download_actions(paths, config)
             return
 
         write_section("Update catalog downloads")
@@ -1761,32 +2198,7 @@ class WorkshopAnalysis:
                 break
             print("WARNING: Invalid selection.")
 
-        selected = self.prompt_workshop_update_selection(candidates)
-        if not selected:
-            print("No workshop content selected for update.")
-            return
-
-        updated = 0
-        for candidate in selected:
-            game = candidate["Game"]
-            workshop_item = candidate["WorkshopItem"]
-            print()
-            print(
-                "Updating {0}".format(
-                    self.describe_game_with_content(game, workshop_item)
-                )
-            )
-            self.download_and_record_workshop_content(
-                paths,
-                config,
-                database,
-                game,
-                workshop_item,
-            )
-            updated += 1
-
-        print()
-        print("Updated {0} workshop item(s).".format(updated))
+        self.update_selected_workshop_downloads(paths, config, database, candidates)
 
     @staticmethod
     def print_command_help():
@@ -1796,8 +2208,7 @@ class WorkshopAnalysis:
         print("  reconfigure    Re-run bootstrap prompts and update configuration.")
         print("  download       Select a game/workshop item, download it, and show analysis next steps.")
         print("  analyze        Analyze downloaded workshop content in automatic or manual mode.")
-        print("  update         Re-download cataloged workshop content.")
-        print("  catalog        Manage games and associated workshop content.")
+        print("  catalog        Manage games, workshop content, and catalog updates.")
         print("  status         Show state paths and catalog counts.")
         print("  help           Show this command list.")
         print("  exit           Leave the command interpreter.")
@@ -1805,7 +2216,7 @@ class WorkshopAnalysis:
         print("One-shot download:")
         print("  download <AppID> <WorkshopContentID> --type source2 --anonymous")
         print()
-        print("Aliases: run=download, refresh=update, manage=inventory=catalog, quit=exit, ?=help")
+        print("Aliases: run=download, manage=inventory=catalog, quit=exit, ?=help")
 
     @staticmethod
     def print_status(paths, config, database):
@@ -1944,8 +2355,7 @@ class WorkshopAnalysis:
         print(self.color_text("Primary Actions", "bold"))
         self.print_menu_item("D", "Download", "choose game/workshop content and install it", "green")
         self.print_menu_item("A", "Analyze", "run automatic/manual analysis on downloaded content", "magenta")
-        self.print_menu_item("U", "Update", "refresh all or selected catalog downloads", "yellow")
-        self.print_menu_item("C", "Catalog", "add, edit, remove, or install content", "cyan")
+        self.print_menu_item("C", "Catalog", "add, edit, remove, install, or update content", "cyan")
         print()
         print(self.color_text("Utilities", "bold"))
         self.print_menu_item("S", "Status", "show config, database, and counts", "blue")
@@ -1985,15 +2395,13 @@ class WorkshopAnalysis:
             return ["download"]
         if lowered in ("a", "2"):
             return ["analyze"]
-        if lowered in ("u", "3"):
-            return ["update"]
-        if lowered in ("c", "4"):
+        if lowered in ("c", "3"):
             return ["catalog"]
-        if lowered in ("s", "5"):
+        if lowered in ("s", "4"):
             return ["status"]
-        if lowered in ("b", "6"):
+        if lowered in ("b", "5"):
             return ["reconfigure" if has_config else "bootstrap"]
-        if lowered in ("h", "?", "7"):
+        if lowered in ("h", "?", "6"):
             return ["help"]
         if lowered in (":", ";"):
             command = input("Command: ").strip()
@@ -2037,10 +2445,6 @@ class WorkshopAnalysis:
         if command in ("analyze", "analyse"):
             mode = tokens[1] if len(tokens) > 1 else None
             self.analyze_workshop_content(paths, has_config, config, database, mode)
-            return True
-
-        if command in ("update", "refresh"):
-            self.update_catalog_downloads(paths, has_config, config, database)
             return True
 
         if command in ("catalog", "manage", "inventory"):
