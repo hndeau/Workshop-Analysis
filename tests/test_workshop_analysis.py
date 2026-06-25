@@ -882,21 +882,106 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
         self.assertIn("images/preview.png", manual_paths)
         self.assertIn("archive_corrupt", [event["Type"] for event in manual_result["Events"]])
 
-    def test_unreal5_analysis_returns_stub_report_shape(self):
+    def test_unreal5_analysis_lists_files_and_tool_container_entries(self):
+        app = self.app()
+        retoc = self.temp_dir / "tools" / "retoc.exe"
+        unrealpak = self.temp_dir / "tools" / "UnrealPak.exe"
+        retoc.parent.mkdir(parents=True)
+        retoc.write_text("retoc", encoding="utf-8")
+        unrealpak.write_text("unrealpak", encoding="utf-8")
+        analyzer = wa.WorkshopAnalyzer(
+            app.state_paths()["ConfigPath"].parent,
+            tool_config={
+                "Unreal5": {
+                    "RetocPath": str(retoc),
+                    "UnrealPakPath": str(unrealpak),
+                }
+            },
+        )
+        content_dir = self.temp_dir / "ue5-content"
+        (content_dir / "Content" / "Paks").mkdir(parents=True)
+        (content_dir / "Config").mkdir()
+        (content_dir / "Config" / "DefaultGame.ini").write_text("[Game]", encoding="utf-8")
+        (content_dir / "Content" / "Paks" / "pakchunk0-Windows.pak").write_text("pak", encoding="utf-8")
+        (content_dir / "Content" / "Paks" / "pakchunk0-Windows.utoc").write_text("utoc", encoding="utf-8")
+        (content_dir / "Content" / "Paks" / "pakchunk0-Windows.ucas").write_text("ucas", encoding="utf-8")
+        game = {"Title": "UE Game", "AppId": "500", "GameTypeId": "unreal5"}
+        item = {"Title": "Item", "ContentId": "600"}
+
+        def fake_tool(command, check=False, **kwargs):
+            command_text = " ".join(str(part) for part in command)
+            if "UnrealPak" in command_text:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="LogPakFile: Display: Content/Blueprints/BP_Test.uasset\n",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Content/Scripts/Logic.uasset\nContent/Config/Data.ini\n",
+            )
+
+        with mock.patch("subprocess.run", side_effect=fake_tool):
+            result = analyzer.analyze(game, item, content_dir, "auto")
+        full_report = json.loads(Path(result["ReportPath"]).read_text(encoding="utf-8"))
+        auto_paths = [finding["Path"] for finding in result["Findings"]]
+        full_paths = [observation["Path"] for observation in full_report["Observations"]]
+
+        self.assertEqual(result["GameTypeId"], "unreal5")
+        self.assertEqual(full_report["GameTypeId"], "unreal5")
+        self.assertIn("Config/DefaultGame.ini", full_paths)
+        self.assertIn("Content/Blueprints/BP_Test.uasset", auto_paths)
+        self.assertIn("Content/Scripts/Logic.uasset", auto_paths)
+        self.assertIn("Content/Config/Data.ini", auto_paths)
+        self.assertEqual(full_report["Summary"]["ToolInvocationCount"], 2)
+
+    def test_unreal5_analysis_records_missing_tools_and_iostore_pair_errors(self):
         app = self.app()
         analyzer = wa.WorkshopAnalyzer(app.state_paths()["ConfigPath"].parent)
-        content_dir = self.temp_dir / "ue5-content"
+        content_dir = self.temp_dir / "ue5-missing-tools"
         content_dir.mkdir()
+        (content_dir / "chunk.pak").write_text("pak", encoding="utf-8")
+        (content_dir / "global.utoc").write_text("utoc", encoding="utf-8")
         game = {"Title": "UE Game", "AppId": "500", "GameTypeId": "unreal5"}
         item = {"Title": "Item", "ContentId": "600"}
 
         result = analyzer.analyze(game, item, content_dir, "auto")
-        full_report = json.loads(Path(result["ReportPath"]).read_text(encoding="utf-8"))
+        event_types = [event["Type"] for event in result["Events"]]
 
-        self.assertEqual(result["GameTypeId"], "unreal5")
-        self.assertEqual(full_report["GameTypeId"], "unreal5")
-        self.assertEqual(full_report["Observations"], [])
-        self.assertEqual(full_report["Events"][0]["Type"], "analysis_stub")
+        self.assertIn("pak_listing_tool_missing", event_types)
+        self.assertIn("iostore_listing_tool_missing", event_types)
+        self.assertIn("iostore_ucas_missing", event_types)
+
+    def test_unreal5_analysis_bootstrap_downloads_tools_automatically(self):
+        app = self.app()
+        paths = app.state_paths()
+        config = self.config(app)
+        db = self.database()
+        game = db.create_game("UE Game", "500", "unreal5")
+        item = db.create_workshop_content(game["Id"], "Item", "600")
+        content_dir = self.temp_dir / "ue5-bootstrap"
+        content_dir.mkdir()
+        (content_dir / "DefaultGame.ini").write_text("[Game]", encoding="utf-8")
+        db.update_workshop_download(item["Id"], "2026-06-24T00:00:00Z", content_dir)
+
+        retoc_path = self.temp_dir / "retoc" / "retoc.exe"
+        fmodel_path = self.temp_dir / "fmodel" / "FModel.exe"
+
+        def fake_install(repository, pattern, install_dir, executable_name):
+            if executable_name == "retoc.exe":
+                retoc_path.parent.mkdir(parents=True, exist_ok=True)
+                retoc_path.write_text("retoc", encoding="utf-8")
+                return str(retoc_path)
+            fmodel_path.parent.mkdir(parents=True, exist_ok=True)
+            fmodel_path.write_text("fmodel", encoding="utf-8")
+            return str(fmodel_path)
+
+        with mock.patch("workshop_analysis_app.app.install_zip_tool_from_github", side_effect=fake_install):
+            self.run_quietly(
+                lambda: app.run_game_analysis(paths, config, game, db.get_workshop_content(item["Id"]), content_dir, "auto")
+            )
+
+        self.assertEqual(config["Tools"]["Unreal5"]["RetocPath"], str(retoc_path))
+        self.assertEqual(config["Tools"]["Unreal5"]["FModelPath"], str(fmodel_path))
 
     def test_analyze_command_uses_game_type_and_prompts_only_for_mode(self):
         app = self.app()

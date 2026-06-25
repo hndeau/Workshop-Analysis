@@ -417,7 +417,7 @@ class WorkshopAnalysis:
 
         source2["InstallDir"] = install_dir
 
-    def ensure_unreal5_tools(self, config):
+    def ensure_unreal5_tools(self, config, automatic=False):
         unreal5 = config["Tools"]["Unreal5"]
         retoc_path = as_path(unreal5.get("RetocPath"))
         fmodel_path = as_path(unreal5.get("FModelPath"))
@@ -427,12 +427,17 @@ class WorkshopAnalysis:
             return
 
         write_section("Unreal Engine 5 tool setup")
-        install_dir = prompt_non_empty("UE5 tool install directory", unreal5.get("InstallDir"))
+        if automatic:
+            install_dir = unreal5.get("InstallDir")
+            print("Using UE5 tool install directory: {0}".format(install_dir))
+        else:
+            install_dir = prompt_non_empty("UE5 tool install directory", unreal5.get("InstallDir"))
         ensure_directory(install_dir)
 
-        if not retoc_ok and prompt_yes_no("Install retoc CLI for .utoc/.ucas extraction?", True):
+        if not retoc_ok and (automatic or prompt_yes_no("Install retoc CLI for .utoc/.ucas extraction?", True)):
             try:
                 retoc_dir = Path(install_dir) / "retoc"
+                print("Installing retoc CLI...")
                 unreal5["RetocPath"] = install_zip_tool_from_github(
                     "trumank/retoc",
                     r"retoc-x86_64-pc-windows-msvc\.zip$",
@@ -441,15 +446,18 @@ class WorkshopAnalysis:
                 )
             except Exception as exc:
                 print("WARNING: retoc auto-install failed: {0}".format(exc))
-                manual_path = input("Optional path to existing retoc.exe (blank to skip): ").strip()
-                if manual_path and Path(manual_path).exists():
-                    unreal5["RetocPath"] = manual_path
+                if not automatic:
+                    manual_path = input("Optional path to existing retoc.exe (blank to skip): ").strip()
+                    if manual_path and Path(manual_path).exists():
+                        unreal5["RetocPath"] = manual_path
 
-        if not fmodel_ok and prompt_yes_no(
-            "Install FModel portable build if a release asset is available?", True
+        if not fmodel_ok and (
+            automatic
+            or prompt_yes_no("Install FModel portable build if a release asset is available?", True)
         ):
             try:
                 fmodel_dir = Path(install_dir) / "FModel"
+                print("Installing FModel portable build...")
                 unreal5["FModelPath"] = install_zip_tool_from_github(
                     "4sval/FModel",
                     r"FModel.*(win|Windows|x64).*\.zip$|FModel.*\.zip$",
@@ -460,7 +468,11 @@ class WorkshopAnalysis:
                 print("WARNING: FModel auto-install failed: {0}".format(exc))
                 print("WARNING: You can install FModel manually later and store the path in config.json.")
 
-        engine_dir = input("Optional Unreal Engine install dir for UnrealPak.exe (blank to skip): ").strip()
+        engine_dir = ""
+        if automatic:
+            engine_dir = unreal5.get("UnrealEngineDir") or ""
+        else:
+            engine_dir = input("Optional Unreal Engine install dir for UnrealPak.exe (blank to skip): ").strip()
         if engine_dir:
             unreal_pak = Path(engine_dir) / "Engine" / "Binaries" / "Win64" / "UnrealPak.exe"
             if unreal_pak.exists():
@@ -487,6 +499,17 @@ class WorkshopAnalysis:
             self.ensure_source2_tools(config)
         elif game_type_id == "unreal5":
             self.ensure_unreal5_tools(config)
+        else:
+            raise RuntimeError("Unsupported game type '{0}'.".format(game_type_id))
+
+    def ensure_analysis_tools_for_game_type(self, config, game_type_id):
+        if self.no_tool_bootstrap:
+            return
+
+        if game_type_id == "unreal5":
+            self.ensure_unreal5_tools(config, automatic=True)
+        elif game_type_id == "source2":
+            return
         else:
             raise RuntimeError("Unsupported game type '{0}'.".format(game_type_id))
 
@@ -1268,7 +1291,15 @@ class WorkshopAnalysis:
         if not content_path or not Path(content_path).exists():
             raise RuntimeError("Downloaded content was not found for analysis.")
 
-        analyzer = WorkshopAnalyzer(paths["ConfigPath"].parent)
+        self.ensure_analysis_tools_for_game_type(config, game.get("GameTypeId"))
+        self.update_config_timestamp(config)
+        save_json_file(paths["ConfigPath"], config)
+
+        analyzer = WorkshopAnalyzer(
+            paths["ConfigPath"].parent,
+            tool_config=config.get("Tools", {}),
+            debug=self.debug,
+        )
         result = analyzer.analyze(game, workshop_item, content_path, mode)
         self.print_analysis_result(result)
         return result

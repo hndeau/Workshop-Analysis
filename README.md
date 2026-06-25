@@ -115,7 +115,9 @@ Analysis is routed automatically by the selected game's type. The user chooses o
 
 Each analysis writes a full raw report to `state\analysis\<AppID>\<ContentID>\analysis.json`. That report includes every observed file, generated file, event, warning, and error from the analysis pass, including corrupt or partially corrupt archives that may indicate decompression risk. Automatic and manual modes only control the curated presentation shown to the user; they do not reduce what is written to `analysis.json`.
 
-Source 2 analysis currently scans downloaded files, safely expands ZIP archives, parses VPK directory files to list contained package entries, records archive/VPK parsing errors as events, and marks the downloaded content as analyzed. Unreal Engine 5 analysis currently writes the same report shape with a stub event so the UE5 implementation can use the same content -> analysis -> full report -> curated presentation flow later.
+Source 2 analysis currently scans downloaded files, safely expands ZIP archives, parses VPK directory files to list contained package entries, records archive/VPK parsing errors as events, and marks the downloaded content as analyzed.
+
+Unreal Engine 5 analysis uses the same report flow. It scans downloaded files, safely expands ZIP archives, classifies UE package/config/script files, records pak/IO Store containers, and uses configured tools when available: `retoc` lists `.utoc`/`.ucas` IO Store contents, and `UnrealPak.exe` lists `.pak` contents when an Unreal Engine path has been configured. During analysis bootstrap the app automatically attempts to install retoc and FModel into the configured UE5 tool directory; UnrealPak must still come from an Unreal Engine installation.
 
 You can also run one command and exit, similar to tools like SBT:
 

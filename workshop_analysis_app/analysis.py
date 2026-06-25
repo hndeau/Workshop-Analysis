@@ -3,6 +3,7 @@
 import json
 import shutil
 import struct
+import subprocess
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,7 +63,28 @@ SOURCE2_PROGRAMMATIC_EXTENSIONS = {
     ".xml",
 }
 
-PACKAGE_EXTENSIONS = {".vpk", ".zip"}
+UNREAL_PROGRAMMATIC_EXTENSIONS = {
+    ".ini",
+    ".int",
+    ".json",
+    ".locmeta",
+    ".uproject",
+    ".uplugin",
+    ".usmap",
+    ".utxt",
+    ".xml",
+}
+
+UNREAL_ASSET_EXTENSIONS = {
+    ".uasset",
+    ".ubulk",
+    ".ucas",
+    ".uexp",
+    ".umap",
+    ".utoc",
+}
+
+PACKAGE_EXTENSIONS = {".pak", ".utoc", ".ucas", ".vpk", ".zip"}
 
 LOW_SIGNAL_ASSET_EXTENSIONS = {
     ".ani",
@@ -219,8 +241,10 @@ def parse_vpk_directory(path):
 
 
 class WorkshopAnalyzer:
-    def __init__(self, state_root):
+    def __init__(self, state_root, tool_config=None, debug=False):
         self.state_root = Path(state_root)
+        self.tool_config = tool_config or {}
+        self.debug = debug
 
     def analysis_root(self, game, workshop_item):
         return (
@@ -236,7 +260,7 @@ class WorkshopAnalyzer:
         if game_type == "source2":
             return self.analyze_source2(game, workshop_item, content_path, mode)
         if game_type == "unreal5":
-            return self.analyze_unreal5_stub(game, workshop_item, content_path, mode)
+            return self.analyze_unreal5(game, workshop_item, content_path, mode)
         return self.analyze_unsupported_stub(game, workshop_item, content_path, mode)
 
     def analyze_source2(self, game, workshop_item, content_path, mode="auto"):
@@ -257,8 +281,8 @@ class WorkshopAnalyzer:
             ).to_dict()
         )
         observations = []
-        observations.extend(self.collect_filesystem_observations(content_path, report))
-        observations.extend(self.expand_zip_archives(content_path, expanded_root, report))
+        observations.extend(self.collect_filesystem_observations(content_path, report, "source2"))
+        observations.extend(self.expand_zip_archives(content_path, expanded_root, report, "source2"))
         observations.extend(self.collect_vpk_observations(content_path, report))
         report["Observations"] = [observation.to_dict() for observation in sort_findings(observations)]
 
@@ -267,23 +291,29 @@ class WorkshopAnalyzer:
         self.write_content_marker(content_path, report)
         return curate_report(report, mode)
 
-    def analyze_unreal5_stub(self, game, workshop_item, content_path, mode="auto"):
+    def analyze_unreal5(self, game, workshop_item, content_path, mode="auto"):
         content_path = Path(content_path)
         output_root = self.analysis_root(game, workshop_item)
+        expanded_root = output_root / "expanded"
         if output_root.exists():
             shutil.rmtree(output_root)
-        ensure_directory(output_root)
+        ensure_directory(expanded_root)
 
         report = self.new_report(game, workshop_item, content_path, output_root, "unreal5", mode)
         report["Events"].append(
             AnalysisEvent(
-                "warning",
-                "analysis_stub",
-                "Unreal Engine 5 analysis is not implemented yet.",
+                "info",
+                "analysis_started",
+                "Started Unreal Engine 5 analysis.",
                 source="analysis",
-                severity=70,
             ).to_dict()
         )
+        observations = []
+        observations.extend(self.collect_filesystem_observations(content_path, report, "unreal5"))
+        observations.extend(self.expand_zip_archives(content_path, expanded_root, report, "unreal5"))
+        observations.extend(self.collect_unreal_container_observations(content_path, report))
+        report["Observations"] = [observation.to_dict() for observation in sort_findings(observations)]
+
         self.finalize_report(report)
         self.write_report(output_root, report)
         self.write_content_marker(content_path, report)
@@ -333,6 +363,7 @@ class WorkshopAnalyzer:
             "Observations": [],
             "Events": [],
             "GeneratedFiles": [],
+            "ToolInvocations": [],
             "Summary": {},
         }
 
@@ -346,6 +377,7 @@ class WorkshopAnalyzer:
             "ErrorCount": sum(1 for event in events if event.get("Level") == "error"),
             "WarningCount": sum(1 for event in events if event.get("Level") == "warning"),
             "GeneratedFileCount": len(report.get("GeneratedFiles", [])),
+            "ToolInvocationCount": len(report.get("ToolInvocations", [])),
         }
 
     @staticmethod
@@ -358,7 +390,7 @@ class WorkshopAnalyzer:
         report.setdefault("Summary", {})["GeneratedFileCount"] = len(report["GeneratedFiles"])
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
-    def collect_filesystem_observations(self, content_path, report):
+    def collect_filesystem_observations(self, content_path, report, game_type_id):
         observations = []
         for path in Path(content_path).rglob("*"):
             if not path.is_file():
@@ -380,10 +412,10 @@ class WorkshopAnalyzer:
                         severity=60,
                     ).to_dict()
                 )
-            observations.append(classify_path(label, "filesystem", size_bytes=size))
+            observations.append(classify_path(label, "filesystem", size_bytes=size, game_type_id=game_type_id))
         return observations
 
-    def expand_zip_archives(self, content_path, expanded_root, report):
+    def expand_zip_archives(self, content_path, expanded_root, report, game_type_id):
         observations = []
         for archive_path in Path(content_path).rglob("*.zip"):
             if ".workshop_analysis" in archive_path.parts:
@@ -419,6 +451,7 @@ class WorkshopAnalyzer:
                                     "zip",
                                     size_bytes=member.file_size,
                                     container=archive_label,
+                                    game_type_id=game_type_id,
                                 )
                             )
                         except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
@@ -489,6 +522,176 @@ class WorkshopAnalyzer:
                 )
         return observations
 
+    def collect_unreal_container_observations(self, content_path, report):
+        observations = []
+        observations.extend(self.collect_unreal_pak_observations(content_path, report))
+        observations.extend(self.collect_unreal_iostore_observations(content_path, report))
+        return observations
+
+    def collect_unreal_pak_observations(self, content_path, report):
+        observations = []
+        unreal_pak = self.unreal_tool_path("UnrealPakPath")
+        for pak_path in Path(content_path).rglob("*.pak"):
+            if ".workshop_analysis" in pak_path.parts:
+                continue
+            pak_label = relative_label(content_path, pak_path)
+            if not unreal_pak:
+                report["Events"].append(
+                    AnalysisEvent(
+                        "warning",
+                        "pak_listing_tool_missing",
+                        "UnrealPak.exe is not configured; package contents could not be listed.",
+                        path=pak_label,
+                        source="unrealpak",
+                        severity=70,
+                    ).to_dict()
+                )
+                continue
+
+            result = self.run_tool(
+                report,
+                "UnrealPak",
+                [str(unreal_pak), str(pak_path), "-List"],
+                source="unrealpak",
+                container=pak_label,
+            )
+            if result.get("ExitCode") != 0:
+                continue
+            for entry in parse_unrealpak_list_output(result.get("Output", "")):
+                observations.append(
+                    classify_path(
+                        entry,
+                        "unrealpak",
+                        container=pak_label,
+                        game_type_id="unreal5",
+                    )
+                )
+        return observations
+
+    def collect_unreal_iostore_observations(self, content_path, report):
+        observations = []
+        retoc = self.unreal_tool_path("RetocPath")
+        for utoc_path in Path(content_path).rglob("*.utoc"):
+            if ".workshop_analysis" in utoc_path.parts:
+                continue
+            utoc_label = relative_label(content_path, utoc_path)
+            ucas_path = utoc_path.with_suffix(".ucas")
+            if not ucas_path.exists():
+                report["Events"].append(
+                    AnalysisEvent(
+                        "error",
+                        "iostore_ucas_missing",
+                        "Matching .ucas file was not found for this .utoc container.",
+                        path=utoc_label,
+                        source="retoc",
+                        severity=85,
+                    ).to_dict()
+                )
+            if not retoc:
+                report["Events"].append(
+                    AnalysisEvent(
+                        "warning",
+                        "iostore_listing_tool_missing",
+                        "retoc.exe is not configured; IO Store contents could not be listed.",
+                        path=utoc_label,
+                        source="retoc",
+                        severity=70,
+                    ).to_dict()
+                )
+                continue
+
+            result = self.run_tool(
+                report,
+                "retoc",
+                [str(retoc), "list", str(utoc_path)],
+                source="retoc",
+                container=utoc_label,
+            )
+            if result.get("ExitCode") != 0:
+                continue
+            for entry in parse_retoc_list_output(result.get("Output", "")):
+                observations.append(
+                    classify_path(
+                        entry,
+                        "retoc",
+                        container=utoc_label,
+                        game_type_id="unreal5",
+                    )
+                )
+        return observations
+
+    def unreal_tool_path(self, key):
+        unreal5 = self.tool_config.get("Unreal5", self.tool_config)
+        value = unreal5.get(key) if isinstance(unreal5, dict) else None
+        if not value:
+            return None
+        path = Path(value)
+        return path if path.exists() else None
+
+    def run_tool(self, report, tool_name, command, source, container="", timeout_seconds=180):
+        invocation = {
+            "Tool": tool_name,
+            "Command": [str(part) for part in command],
+            "StartedUtc": utc_now_iso(),
+            "CompletedUtc": None,
+            "ExitCode": None,
+            "Output": "",
+            "Error": "",
+        }
+        try:
+            result = subprocess.run(
+                [str(part) for part in command],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+            )
+            invocation["CompletedUtc"] = utc_now_iso()
+            invocation["ExitCode"] = result.returncode
+            invocation["Output"] = getattr(result, "stdout", "") or ""
+            if result.returncode != 0:
+                report["Events"].append(
+                    AnalysisEvent(
+                        "error",
+                        "tool_exit_nonzero",
+                        "{0} exited with code {1}.".format(tool_name, result.returncode),
+                        source=source,
+                        container=container,
+                        severity=90,
+                    ).to_dict()
+                )
+        except subprocess.TimeoutExpired as exc:
+            invocation["CompletedUtc"] = utc_now_iso()
+            invocation["Error"] = str(exc)
+            report["Events"].append(
+                AnalysisEvent(
+                    "error",
+                    "tool_timeout",
+                    str(exc),
+                    source=source,
+                    container=container,
+                    severity=90,
+                ).to_dict()
+            )
+        except OSError as exc:
+            invocation["CompletedUtc"] = utc_now_iso()
+            invocation["Error"] = str(exc)
+            report["Events"].append(
+                AnalysisEvent(
+                    "error",
+                    "tool_launch_error",
+                    str(exc),
+                    source=source,
+                    container=container,
+                    severity=90,
+                ).to_dict()
+            )
+        report["ToolInvocations"].append(invocation)
+        return invocation
+
     @staticmethod
     def write_content_marker(content_path, result):
         marker_dir = ensure_directory(Path(content_path) / ".workshop_analysis")
@@ -521,7 +724,61 @@ def safe_path_fragment(value):
     return "".join(character if character.isalnum() else "_" for character in str(value)).strip("_") or "archive"
 
 
-def classify_path(path, source, size_bytes=0, container=""):
+def parse_unrealpak_list_output(output):
+    entries = []
+    for line in (output or "").splitlines():
+        entry = extract_unreal_path_from_line(line)
+        if entry:
+            entries.append(entry)
+    return dedupe_preserving_order(entries)
+
+
+def parse_retoc_list_output(output):
+    entries = []
+    for line in (output or "").splitlines():
+        entry = extract_unreal_path_from_line(line)
+        if entry:
+            entries.append(entry)
+    return dedupe_preserving_order(entries)
+
+
+def extract_unreal_path_from_line(line):
+    text = (line or "").strip().strip('"')
+    if not text:
+        return None
+    if text.startswith("[") or text.lower().startswith(("warning", "error", "detected ")):
+        return None
+
+    candidates = []
+    for token in text.replace("\\", "/").split():
+        token = token.strip().strip('"').strip(",")
+        if "/" in token or token.lower().endswith(tuple(UNREAL_ASSET_EXTENSIONS | UNREAL_PROGRAMMATIC_EXTENSIONS)):
+            candidates.append(token)
+    if not candidates and "/" in text:
+        candidates.append(text)
+
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if lowered.startswith(("mount point", "log", "display:")):
+            continue
+        if ":" in candidate and not candidate.startswith("/"):
+            continue
+        return candidate.lstrip("/")
+    return None
+
+
+def dedupe_preserving_order(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def classify_path(path, source, size_bytes=0, container="", game_type_id="source2"):
     suffix = Path(path).suffix.lower()
     name = Path(path).name.lower()
     reason = "General content"
@@ -533,7 +790,13 @@ def classify_path(path, source, size_bytes=0, container=""):
     elif suffix in SCRIPT_EXTENSIONS:
         severity = 90
         reason = "Script or source code"
-    elif suffix in SOURCE2_PROGRAMMATIC_EXTENSIONS or name in INTERESTING_NAMES:
+    elif game_type_id == "unreal5" and suffix in UNREAL_PROGRAMMATIC_EXTENSIONS:
+        severity = 80
+        reason = "Unreal Engine programmatic/config data"
+    elif game_type_id == "unreal5" and suffix in UNREAL_ASSET_EXTENSIONS:
+        severity = 75
+        reason = "Unreal Engine cooked asset or IO Store data"
+    elif game_type_id == "source2" and (suffix in SOURCE2_PROGRAMMATIC_EXTENSIONS or name in INTERESTING_NAMES):
         severity = 80
         reason = "Source 2 programmatic/config data"
     elif suffix in PACKAGE_EXTENSIONS:
