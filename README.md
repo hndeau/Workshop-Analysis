@@ -17,10 +17,11 @@ Supported game/tooling profiles:
 
 - Windows PowerShell 5.1 or newer.
 - Python 3.9 or newer.
+- .NET SDK 8.0 or newer for UE5 parser tooling such as UAssetGUI and kismet-analyzer.
 - Internet access for first-time setup and tool downloads.
 - SteamCMD, installed by the bootstrap flow.
 
-If Python is missing, `setup.ps1` attempts to install it with `winget`. If `winget` is also missing, setup first runs `Install-Winget.ps1` to bootstrap winget/App Installer.
+If Python or .NET SDK 8+ is missing, `setup.ps1` attempts to install it with `winget`. If `winget` is also missing, setup first runs `Install-Winget.ps1` to bootstrap winget/App Installer.
 
 Runtime Python package dependencies are listed in `requirements.txt`. The project currently uses only the Python standard library, so the file contains no active third-party packages.
 
@@ -43,8 +44,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
 1. Finds Python 3.9+ if already installed.
 2. Installs winget when needed by invoking `Install-Winget.ps1`.
 3. Installs Python 3.12 through winget when Python is missing.
-4. Installs Python package requirements if `requirements.txt` exists.
-5. Runs `.\WorkshopAnalysis`.
+4. Installs .NET SDK 8 through winget when .NET SDK 8+ is missing.
+5. Installs Python package requirements if `requirements.txt` exists.
+6. Runs `.\WorkshopAnalysis`.
 
 To validate dependencies without launching bootstrap:
 

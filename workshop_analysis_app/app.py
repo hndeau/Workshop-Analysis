@@ -658,7 +658,7 @@ class WorkshopAnalysis:
         try:
             if not source_dir.exists():
                 print("Cloning kismet-analyzer source...")
-                subprocess.run(
+                clone = subprocess.run(
                     [
                         git_exe,
                         "clone",
@@ -668,7 +668,7 @@ class WorkshopAnalysis:
                         "https://github.com/trumank/kismet-analyzer.git",
                         str(source_dir),
                     ],
-                    check=True,
+                    check=False,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -676,8 +676,42 @@ class WorkshopAnalysis:
                     errors="replace",
                     timeout=180,
                 )
+                if clone.returncode != 0:
+                    raise RuntimeError(
+                        "git clone failed with code {0}: {1}".format(
+                            clone.returncode,
+                            self.tool_output_preview(clone.stdout),
+                        )
+                    )
+
+            submodules = subprocess.run(
+                [
+                    git_exe,
+                    "-C",
+                    str(source_dir),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+            if submodules.returncode != 0:
+                raise RuntimeError(
+                    "git submodule update failed with code {0}: {1}".format(
+                        submodules.returncode,
+                        self.tool_output_preview(submodules.stdout),
+                    )
+                )
+
             print("Building kismet-analyzer...")
-            subprocess.run(
+            publish = subprocess.run(
                 [
                     dotnet_exe,
                     "publish",
@@ -691,7 +725,7 @@ class WorkshopAnalysis:
                     "-o",
                     str(publish_dir),
                 ],
-                check=True,
+                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -699,6 +733,13 @@ class WorkshopAnalysis:
                 errors="replace",
                 timeout=300,
             )
+            if publish.returncode != 0:
+                raise RuntimeError(
+                    "dotnet publish failed with code {0}: {1}".format(
+                        publish.returncode,
+                        self.tool_output_preview(publish.stdout),
+                    )
+                )
             exe_path = publish_dir / "kismet-analyzer.exe"
             if exe_path.exists():
                 unreal5["KismetAnalyzerPath"] = str(exe_path)

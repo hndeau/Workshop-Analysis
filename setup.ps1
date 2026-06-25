@@ -18,6 +18,7 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $MinimumPythonVersion = [version]'3.9'
+$MinimumDotNetSdkVersion = [version]'8.0'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Write-Section {
@@ -128,8 +129,13 @@ function Refresh-ProcessPath {
     $knownRoots = @(
         (Join-Path $env:LocalAppData 'Microsoft\WindowsApps'),
         (Join-Path $env:LocalAppData 'Programs\Python'),
-        (Join-Path $env:ProgramFiles 'Python')
+        (Join-Path $env:ProgramFiles 'Python'),
+        (Join-Path $env:ProgramFiles 'dotnet')
     )
+
+    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+        $knownRoots += (Join-Path ${env:ProgramFiles(x86)} 'dotnet')
+    }
 
     foreach ($root in $knownRoots) {
         if (Test-Path -LiteralPath $root) {
@@ -366,6 +372,78 @@ function Install-Python {
     }
 }
 
+function Find-DotNetSdk {
+    $dotnetCommand = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+    if (-not $dotnetCommand) {
+        return $null
+    }
+
+    try {
+        $probe = Invoke-ProcessCapture -Exe $dotnetCommand.Source -Arguments @('--list-sdks')
+        if ($probe.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($probe.Output)) {
+            return $null
+        }
+
+        $versions = New-Object System.Collections.Generic.List[version]
+        foreach ($line in ($probe.Output -split "`r?`n")) {
+            if ($line -match '^([0-9]+(?:\.[0-9]+){1,2})') {
+                $versions.Add([version]$Matches[1]) | Out-Null
+            }
+        }
+
+        $selected = $versions |
+            Where-Object { $_ -ge $MinimumDotNetSdkVersion } |
+            Sort-Object -Descending |
+            Select-Object -First 1
+
+        if (-not $selected) {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            Exe = $dotnetCommand.Source
+            Version = $selected
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Install-DotNetSdk {
+    Write-Section -Text '.NET SDK setup'
+
+    $winget = Ensure-Winget
+
+    Write-Host '.NET SDK 8+ was not found. Installing .NET SDK 8 with winget...'
+    for ($attempt = 1; $attempt -le $WingetInstallRetryCount; $attempt++) {
+        if ($WingetInstallRetryCount -gt 1) {
+            Write-Host "winget install attempt $attempt of $WingetInstallRetryCount."
+        }
+
+        & $winget install --id Microsoft.DotNet.SDK.8 --exact --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity
+        $exitCode = $LASTEXITCODE
+        Refresh-ProcessPath
+
+        $installedDotNet = Find-DotNetSdk
+        if ($installedDotNet) {
+            if ($exitCode -ne 0) {
+                Write-Host ".NET SDK $($installedDotNet.Version) is available after winget returned exit code $exitCode."
+            }
+            return
+        }
+
+        if ($attempt -lt $WingetInstallRetryCount) {
+            Write-Warning "winget failed to install .NET SDK 8. Exit code: $exitCode. Retrying in $attempt second(s)."
+            & $winget source update winget --accept-source-agreements --disable-interactivity 2>$null | Out-Null
+            Start-Sleep -Seconds $attempt
+            continue
+        }
+
+        throw "winget failed to install .NET SDK 8 after $WingetInstallRetryCount attempt(s). Last exit code: $exitCode"
+    }
+}
+
 function Install-PythonRequirements {
     param([Parameter(Mandatory)]$Python)
 
@@ -403,6 +481,19 @@ if (-not $python) {
 }
 
 Write-Host "Using Python $($python.Version)."
+
+$dotnet = Find-DotNetSdk
+if (-not $dotnet) {
+    Install-DotNetSdk
+    Refresh-ProcessPath
+    $dotnet = Find-DotNetSdk
+}
+
+if (-not $dotnet) {
+    throw '.NET SDK installation completed, but .NET SDK 8+ could not be found in this shell. Open a new PowerShell window and run setup.ps1 again.'
+}
+
+Write-Host "Using .NET SDK $($dotnet.Version)."
 Install-PythonRequirements -Python $python
 
 if ($SkipBootstrap) {

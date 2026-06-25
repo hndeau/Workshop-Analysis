@@ -1114,6 +1114,46 @@ class DownloadAndToolingTests(WorkshopAnalysisTestCase):
             )
         )
 
+    def test_unreal5_analysis_records_extracted_path_errors_without_aborting(self):
+        app = self.app()
+        analyzer = wa.WorkshopAnalyzer(app.state_paths()["ConfigPath"].parent)
+        content_dir = self.temp_dir / "ue5-path-errors"
+        content_dir.mkdir()
+        (content_dir / "DefaultGame.ini").write_text("[Game]", encoding="utf-8")
+        output_root = analyzer.analysis_root(
+            {"AppId": "500"},
+            {"ContentId": "600"},
+        )
+        extracted_root = output_root / "extracted"
+        extracted_root.mkdir(parents=True)
+        broken = extracted_root / "broken.uasset"
+        broken.write_text("asset", encoding="utf-8")
+        report = analyzer.new_report(
+            {"Title": "UE Game", "AppId": "500"},
+            {"Title": "Item", "ContentId": "600"},
+            content_dir,
+            output_root,
+            "unreal5",
+            "auto",
+        )
+        original_is_file = Path.is_file
+
+        def flaky_is_file(path):
+            if path == broken:
+                raise OSError(3, "The system cannot find the path specified", str(path))
+            return original_is_file(path)
+
+        with mock.patch.object(Path, "is_file", flaky_is_file):
+            observations = analyzer.collect_extracted_file_observations(
+                extracted_root,
+                report,
+                "unreal5",
+            )
+
+        self.assertEqual(observations, [])
+        self.assertIn("path_scan_error", [event["Type"] for event in report["Events"]])
+        self.assertIn("path_unavailable", {item["Reason"] for item in report["BlockedItems"]})
+
     def test_unreal5_analysis_records_missing_tools_and_iostore_pair_errors(self):
         app = self.app()
         analyzer = wa.WorkshopAnalyzer(app.state_paths()["ConfigPath"].parent)

@@ -458,9 +458,7 @@ class WorkshopAnalyzer:
 
     def collect_filesystem_observations(self, content_path, report, game_type_id):
         observations = []
-        for path in Path(content_path).rglob("*"):
-            if not path.is_file():
-                continue
+        for path in self.iter_files_safely(content_path, report, "filesystem"):
             if ".workshop_analysis" in path.parts:
                 continue
             label = relative_label(content_path, path)
@@ -483,7 +481,9 @@ class WorkshopAnalyzer:
 
     def expand_zip_archives(self, content_path, expanded_root, report, game_type_id):
         observations = []
-        for archive_path in Path(content_path).rglob("*.zip"):
+        for archive_path in self.iter_files_safely(content_path, report, "zip_scan"):
+            if archive_path.suffix.lower() != ".zip":
+                continue
             if ".workshop_analysis" in archive_path.parts:
                 continue
             archive_label = relative_label(content_path, archive_path)
@@ -559,7 +559,9 @@ class WorkshopAnalyzer:
 
     def collect_vpk_observations(self, content_path, report):
         observations = []
-        for vpk_path in Path(content_path).rglob("*.vpk"):
+        for vpk_path in self.iter_files_safely(content_path, report, "vpk_scan"):
+            if vpk_path.suffix.lower() != ".vpk":
+                continue
             if ".workshop_analysis" in vpk_path.parts:
                 continue
             archive_label = relative_label(content_path, vpk_path)
@@ -598,7 +600,9 @@ class WorkshopAnalyzer:
     def collect_unreal_pak_observations(self, content_path, report, extracted_root):
         observations = []
         unreal_pak = self.unreal_tool_path("UnrealPakPath")
-        for pak_path in Path(content_path).rglob("*.pak"):
+        for pak_path in self.iter_files_safely(content_path, report, "unrealpak_scan"):
+            if pak_path.suffix.lower() != ".pak":
+                continue
             if ".workshop_analysis" in pak_path.parts:
                 continue
             pak_label = relative_label(content_path, pak_path)
@@ -655,7 +659,9 @@ class WorkshopAnalyzer:
     def collect_unreal_iostore_observations(self, content_path, report, extracted_root):
         observations = []
         retoc = self.unreal_tool_path("RetocPath")
-        for utoc_path in Path(content_path).rglob("*.utoc"):
+        for utoc_path in self.iter_files_safely(content_path, report, "retoc_scan"):
+            if utoc_path.suffix.lower() != ".utoc":
+                continue
             if ".workshop_analysis" in utoc_path.parts:
                 continue
             utoc_label = relative_label(content_path, utoc_path)
@@ -858,9 +864,7 @@ class WorkshopAnalyzer:
         if not root.exists():
             return observations
 
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
+        for path in self.iter_files_safely(root, report, "extracted_scan"):
             label = relative_label(root, path)
             try:
                 size = path.stat().st_size
@@ -896,8 +900,8 @@ class WorkshopAnalyzer:
         for source, root, inside_container in roots:
             if not root.exists():
                 continue
-            for path in root.rglob("*"):
-                if not path.is_file() or ".workshop_analysis" in path.parts:
+            for path in self.iter_files_safely(root, report, "{0}_script_scan".format(source)):
+                if ".workshop_analysis" in path.parts:
                     continue
                 suffix = path.suffix.lower()
                 name = path.name.lower()
@@ -930,7 +934,11 @@ class WorkshopAnalyzer:
         registry_files = []
         for root in (Path(content_path), Path(extracted_root)):
             if root.exists():
-                registry_files.extend(path for path in root.rglob("AssetRegistry.bin") if path.is_file())
+                registry_files.extend(
+                    path
+                    for path in self.iter_files_safely(root, report, "asset_registry_scan")
+                    if path.name == "AssetRegistry.bin"
+                )
 
         if not registry_files:
             report.setdefault("AssetRegistry", {}).setdefault("Warnings", []).append(
@@ -1082,8 +1090,8 @@ class WorkshopAnalyzer:
         ):
             if not root.exists():
                 continue
-            for path in root.rglob("*"):
-                if not path.is_file() or path.suffix.lower() not in UNREAL_COOKED_PACKAGE_EXTENSIONS:
+            for path in self.iter_files_safely(root, report, "{0}_cooked_asset_scan".format(source)):
+                if path.suffix.lower() not in UNREAL_COOKED_PACKAGE_EXTENSIONS:
                     continue
                 label = relative_label(root, path).replace("\\", "/")
                 key = (source, label)
@@ -1131,7 +1139,47 @@ class WorkshopAnalyzer:
         path = Path(mappings_dir)
         if not path.exists():
             return []
-        return [str(item) for item in path.rglob("*.usmap") if item.is_file()]
+        return [
+            str(item)
+            for item in self.iter_files_safely(path, None, "mappings_scan")
+            if item.suffix.lower() == ".usmap"
+        ]
+
+    def iter_files_safely(self, root, report=None, source="filesystem"):
+        root = Path(root)
+        try:
+            iterator = root.rglob("*")
+            for path in iterator:
+                try:
+                    if path.is_file():
+                        yield path
+                except OSError as exc:
+                    self.record_path_error(report, path, source, exc)
+        except OSError as exc:
+            self.record_path_error(report, root, source, exc)
+
+    @staticmethod
+    def record_path_error(report, path, source, exc):
+        if report is None:
+            return
+        report.setdefault("BlockedItems", []).append(
+            {
+                "Path": str(path),
+                "Reason": "path_unavailable",
+                "Source": source,
+                "Error": str(exc),
+            }
+        )
+        report["Events"].append(
+            AnalysisEvent(
+                "error",
+                "path_scan_error",
+                str(exc),
+                path=str(path),
+                source=source,
+                severity=70,
+            ).to_dict()
+        )
 
     def run_cooked_asset_parser(self, parser_path, candidate, finding, report):
         if not candidate.get("FilesystemPath"):
